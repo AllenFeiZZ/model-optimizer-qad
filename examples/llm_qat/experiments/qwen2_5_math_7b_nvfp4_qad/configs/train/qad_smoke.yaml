@@ -1,0 +1,38 @@
+# Ten-step engineering gate for exact full-vocabulary forward-KL QAD.
+model_name_or_path: ${QAD_FAKEQUANT_MODEL}
+output_dir: ${QAD_OUTPUT_DIR}
+attn_implementation: flash_attention_2
+
+distill: true
+teacher_model: ${QAD_TEACHER_MODEL}
+criterion: logits_loss
+temperature: 1.0
+
+dataset_config: ${QAD_RESOLVED_DATASET_CONFIG}
+train_samples: 224
+eval_samples: 16
+
+max_steps: 10
+learning_rate: 1.0e-5
+per_device_train_batch_size: 1
+per_device_eval_batch_size: 1
+gradient_accumulation_steps: 1
+model_max_length: 2048
+warmup_ratio: 0.0
+lr_scheduler_type: constant
+use_liger_kernel: false
+manual_gc: true
+seed: 42
+do_train: true
+do_eval: false
+eval_strategy: 'no'
+
+# FSDP2 config already enables activation checkpointing. Transformers rejects
+# enabling its separate gradient-checkpointing path at the same time.
+gradient_checkpointing: false
+# The script calls trainer.save_model() once after training. Avoid a full FSDP
+# optimizer checkpoint for this accuracy-recovery gate (about 30 GB at 7B).
+save_strategy: 'no'
+logging_steps: 1
+report_to:
+  - tensorboard

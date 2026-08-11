@@ -1,0 +1,17 @@
+blend_size: 256
+splits:
+  train: 0.90
+  eval: 0.05
+  test: 0.05
+
+sources:
+  - hf_path: json
+    split: train
+    ratio: 1
+    dataset_kwargs:
+      # Resolved by run_qad.sh before ModelOpt loads this blend config.
+      data_files: ${QAD_DATA_FILE}
+    apply_chat_template: true
+    train_only_assistant_tokens: true
+    chat_key: messages
+    category: dapo_math_bf16_generated

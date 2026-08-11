@@ -1,0 +1,36 @@
+# Local single-GPU variant of megatron_lm_ptq.yaml.
+#
+# Usage:
+#   uv run launch.py --yaml examples/Qwen/Qwen3-8B/megatron_lm_ptq_local.yaml hf_local=/mnt/hf-local --yes
+#
+# NOTE: This file uses the raw `script`/`args`/`environment` form because the
+# typed `MegatronLMQuantizeTask` (common/megatron_lm/quantize/task.py) is
+# currently not wired into SandboxPipeline — see the docstring there for
+# rationale. The typed class is retained for future re-enablement.
+
+job_name: Qwen3-8B_NVFP4_local
+pipeline:
+  skip: false
+  allow_to_fail: false
+  note:
+
+  task_0:
+    script: common/megatron_lm/quantize/quantize.sh
+    args:
+      - --calib-dataset-path-or-name /hf-local/abisee/cnn_dailymail
+      - --calib-size 32
+    environment:
+      - MLM_MODEL_CFG: Qwen/Qwen3-8B
+      - QUANT_CFG: NVFP4_DEFAULT_CFG
+      - HF_MODEL_CKPT: /hf-local/Qwen/Qwen3-8B
+      - MMLU_DATASET: /hf-local/cais/mmlu
+      - TP: "1"
+      - PP: "1"
+      - EP: "1"
+      - ETP: "1"
+      - MMLU_LOWER_BOUND: "0.38"
+    slurm_config:
+      _factory_: "slurm_factory"
+      nodes: 1
+      ntasks_per_node: 1
+      gpus_per_node: 1

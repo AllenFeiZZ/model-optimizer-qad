@@ -1,0 +1,80 @@
+name: Bump uv.lock
+
+on:
+  schedule:
+    - cron: "0 9 * * 1" # Every Monday at 9:00 UTC
+  workflow_dispatch:
+    # On-demand
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  bump-uv-lock:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ github.ref_name }}
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+      - run: pip install uv toml
+      - name: Enable torch override in pyproject.toml to avoid unnecessary nvidia-cu* dependencies in uv.lock
+        run: |
+          python -c "
+          import toml
+          t = toml.load('pyproject.toml')
+          t['tool']['uv']['override-dependencies'] = ['torch; sys_platform == \"never\"']
+          toml.dump(t, open('pyproject.toml', 'w'))
+          "
+      - name: Run uv lock upgrade
+        run: |
+          set -o pipefail
+          uv lock --upgrade 2>&1 | tee /tmp/uv_lock_output.txt
+      - name: Check for changes
+        id: changes
+        run: |
+          # Scope to uv.lock: the pyproject.toml torch-override step above rewrites
+          # the whole file (toml.dump drops comments), so an unscoped diff is always
+          # dirty and the no-update path below would fail on an empty commit.
+          if git diff --quiet -- uv.lock; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          fi
+      - name: Create pull request
+        if: steps.changes.outputs.changed == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          BASE="${{ github.ref_name }}"
+          SAFE_BASE=$(echo "$BASE" | tr '/' '-')
+          BRANCH="auto/bump-uv-lock-${SAFE_BASE}-$(date +%Y-%m-%d)"
+          git checkout -b "$BRANCH"
+          git add uv.lock
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git commit -s -m "[chore]: bump uv.lock"
+          git push origin "$BRANCH"
+          UV_OUTPUT=$(cat /tmp/uv_lock_output.txt)
+          gh pr create \
+            --title "[chore]: weekly bump of uv.lock on ${BASE} ($(date +%Y-%m-%d))" \
+            --body "$(cat <<EOF
+          ## Summary
+          Automated weekly update of uv.lock file for nSpect Scanning:
+          - \`uv.lock\` — upgraded all transitive dependencies to latest compatible versions
+
+          <details>
+          <summary>uv lock --upgrade output</summary>
+
+          \`\`\`
+          ${UV_OUTPUT}
+          \`\`\`
+
+          </details>
+          EOF
+          )" \
+            --base "$BASE"

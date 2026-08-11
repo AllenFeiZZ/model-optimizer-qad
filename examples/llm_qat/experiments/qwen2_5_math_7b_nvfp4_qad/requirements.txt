@@ -1,0 +1,7 @@
+-r ../../requirements.txt
+
+# Used by tools/qad_generate_sequences.py.
+aiohttp>=3.9
+
+# Used by the experiment-local configuration resolver.
+PyYAML>=6.0

@@ -1,0 +1,899 @@
+# SPDX-FileCopyrightText: Copyright (c) 2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""Core logic for the ModelOpt Launcher.
+
+Dataclasses, executor builders, and the job run loop used by launch.py.
+"""
+
+import dataclasses
+import getpass
+import json
+import os
+import re
+import shlex
+import subprocess  # nosec B404
+import sys
+from dataclasses import dataclass
+from types import SimpleNamespace
+
+import nemo_run as run
+import yaml
+
+# ---------------------------------------------------------------------------
+# Default environment variables injected into every job
+# ---------------------------------------------------------------------------
+
+DEFAULT_EXPERIMENT_TITLE = "cicd"
+
+
+def get_default_env(experiment_title=None):
+    """Return (slurm_env, local_env) dicts for the given experiment title."""
+    title = experiment_title or DEFAULT_EXPERIMENT_TITLE
+    # specdec_bench upload credentials — forwarded so that the YAML pipeline
+    # step `common/specdec_bench/upload_to_s3.sh` can publish to the team
+    # S3 bucket without baking secrets into committed YAMLs. The prefix
+    # disambiguates from any other S3 creds a CI runner might carry.
+    specdec_s3 = {
+        "SPECDEC_BENCH_S3_ENDPOINT": os.getenv("SPECDEC_BENCH_S3_ENDPOINT", ""),
+        "SPECDEC_BENCH_S3_KEY_ID": os.getenv("SPECDEC_BENCH_S3_KEY_ID", ""),
+        "SPECDEC_BENCH_S3_SECRET": os.getenv("SPECDEC_BENCH_S3_SECRET", ""),
+    }
+    # HF_HOME / TRITON_CACHE_DIR default under the shared /{title} mount, but honor
+    # an env override so a user can point them at a personally-writable path (the
+    # shared cache is owned by the CI account and blocks other users' cache locks).
+    slurm_env = {
+        "TRITON_CACHE_DIR": os.getenv("TRITON_CACHE_DIR", f"/{title}/triton-cache"),
+        "HF_HOME": os.getenv("HF_HOME", f"/{title}/hf-cache"),
+        "HF_TOKEN": os.getenv("HF_TOKEN", ""),
+        "MLM_SKIP_INSTALL": "1",
+        "LAUNCH_SCRIPT": "python",
+        **specdec_s3,
+    }
+    local_env = {
+        "TRITON_CACHE_DIR": os.getenv("TRITON_CACHE_DIR", f"/{title}/triton-cache"),
+        "HF_HOME": os.getenv("HF_HOME", f"/{title}/hf-cache"),
+        "HF_TOKEN": os.getenv("HF_TOKEN", ""),
+        "MLM_SKIP_INSTALL": "1",
+        **specdec_s3,
+    }
+    return slurm_env, local_env
+
+
+# SlurmConfig type — set by the caller via set_slurm_config_type() before use.
+# This allows both slurm.py and launch.py to use their own SlurmConfig class.
+_SLURM_CONFIG_TYPE = None
+_FACTORY_REGISTRY = {}
+
+
+def set_slurm_config_type(cls):
+    """Register the SlurmConfig dataclass type used by SandboxTask."""
+    global _SLURM_CONFIG_TYPE
+    _SLURM_CONFIG_TYPE = cls
+    # Patch every task dataclass so nemo-run's CLI parser sees the concrete
+    # SlurmConfig type for task_0/task_1/... fields, not the base `object`.
+    for task_cls in (
+        SandboxTask,
+        SandboxTask0,
+        SandboxTask1,
+        SandboxTask2,
+        SandboxTask3,
+        SandboxTask4,
+    ):
+        task_cls.__dataclass_fields__["slurm_config"].type = cls
+        task_cls.__annotations__["slurm_config"] = cls
+        task_cls.__init__.__annotations__["slurm_config"] = cls
+
+
+def register_factory(name, fn):
+    """Register a factory function by name for task_configs YAML resolution."""
+    _FACTORY_REGISTRY[name] = fn
+
+
+# ---------------------------------------------------------------------------
+# Task and pipeline dataclasses
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class SandboxTask:
+    """A single task with a script (or inline command), slurm config, args, and environment."""
+
+    script: str = None
+    # Inline shell command run instead of `script` (mutually exclusive; setting
+    # `args` too is rejected — put everything in the command). Lets one-liner jobs
+    # live in the YAML without a wrapper .sh. Must be a SINGLE line: the --yaml CLI
+    # layer rejects multi-line values, so YAMLs use a folded scalar (>-) and `&&`.
+    inline: str = None
+    # pip requirements installed in the container before the command runs
+    # (`pip install [-r reqs_file] [reqs] && <command>`). `reqs` is a raw
+    # pip-install arg string (e.g. "transformers<5 fire"); `reqs_file` is a
+    # requirements.txt path relative to the run dir (e.g.
+    # modules/Model-Optimizer/examples/llm_eval/requirements.txt).
+    reqs: str = None
+    reqs_file: str = None
+    slurm_config: object = None  # Patched at runtime by set_slurm_config_type()
+    args: list[str] = None
+    environment: list[dict[str, str]] = None
+    yaml_file: str = None
+    skip: bool = False
+
+
+@dataclass
+class SandboxTask0(SandboxTask):
+    """Task slot 0 in a pipeline."""
+
+
+@dataclass
+class SandboxTask1(SandboxTask):
+    """Task slot 1 in a pipeline."""
+
+
+@dataclass
+class SandboxTask2(SandboxTask):
+    """Task slot 2 in a pipeline."""
+
+
+@dataclass
+class SandboxTask3(SandboxTask):
+    """Task slot 3 in a pipeline."""
+
+
+@dataclass
+class SandboxTask4(SandboxTask):
+    """Task slot 4 in a pipeline."""
+
+
+def create_task_from_yaml(yaml_file, factory_lookup):
+    """Create a SandboxTask from a YAML config file.
+
+    Args:
+        yaml_file: Path to the YAML config.
+        factory_lookup: Dict mapping factory names to callable factory functions.
+    """
+    with open(yaml_file) as file:
+        config_from_yaml = yaml.safe_load(file)
+
+    script = config_from_yaml["script"]
+    function_name = config_from_yaml["slurm_config"].pop("_factory_")
+    slurm_config = factory_lookup[function_name](**config_from_yaml["slurm_config"])
+    args = config_from_yaml.get("args", None)
+    environment = config_from_yaml.get("environment", None)
+
+    return SandboxTask(script=script, slurm_config=slurm_config, args=args, environment=environment)
+
+
+def _yaml_path_from_argv(argv: list[str] | None = None) -> str | None:
+    """Return the launcher ``--yaml`` path from argv, if present."""
+    argv = list(sys.argv if argv is None else argv)
+    for i, arg in enumerate(argv):
+        if arg == "--yaml" and i + 1 < len(argv):
+            return argv[i + 1]
+        if arg.startswith("--yaml="):
+            return arg.split("=", 1)[1]
+    return None
+
+
+def _explicit_slurm_fields_from_yaml(yaml_path: str | None, task_name: str) -> set[str] | None:
+    """Return raw slurm_config keys explicitly present in a launcher YAML task."""
+    if not yaml_path:
+        return None
+    try:
+        with open(yaml_path) as file:
+            config = yaml.safe_load(file) or {}
+    except (OSError, yaml.YAMLError):
+        return None
+
+    if not isinstance(config, dict):
+        return None
+    pipeline = config.get("pipeline", config)
+    if not isinstance(pipeline, dict):
+        return None
+    task = pipeline.get(task_name)
+    if not isinstance(task, dict):
+        return None
+    slurm_config = task.get("slurm_config")
+    if not isinstance(slurm_config, dict):
+        return None
+    return set(slurm_config) - {"_factory_"}
+
+
+@dataclass
+class GlobalVariables:
+    """Shared variables for <<global_vars.X>> interpolation in pipeline YAMLs."""
+
+    hf_model: str = None
+    hf_data: str = None
+    hf_local: str = None
+    output_dir: str = None
+    # Speculative-decoding draft / assistant model path. SPEED-bench
+    # MTP/EAGLE3/DRAFT_TARGET/DFLASH parent YAMLs reference this via
+    # ``--draft_model_dir <<global_vars.draft_model>>`` on both the
+    # qualitative + throughput_32k tasks so the path lives in one
+    # place. Surfaced on OMNIML-5024: the gemma-4-E4B-it / MTP / vLLM
+    # parent used the indirection but the launcher rejected it with
+    # ``No parameter named 'draft_model' exists`` because the
+    # dataclass schema didn't include the key; the agent worked
+    # around it inline but the canonical YAML stayed broken.
+    draft_model: str = None
+
+
+@dataclass
+class SandboxPipeline:
+    """A multi-task pipeline with shared global variables and task dependencies."""
+
+    global_vars: GlobalVariables = None
+
+    task_0: SandboxTask0 = None
+    task_1: SandboxTask1 = None
+    task_2: SandboxTask2 = None
+    task_3: SandboxTask3 = None
+    task_4: SandboxTask4 = None
+    tasks: list[SandboxTask] = None
+
+    assets: list[str] = None  # HF repo paths (relative to hf_local) to verify before submission
+
+    test_level: int = 0
+    allow_to_fail: bool = False
+    skip: bool = False
+    note: str = ""
+    task_configs: list[str] = None
+    experiment = None
+
+    # Set by caller — used by create_task_from_yaml
+    _factory_lookup: dict = None
+
+    def __post_init__(self):
+        """Collect tasks from slots/configs and resolve <<global_vars.X>> references."""
+        if self.tasks is None:
+            self.tasks = []
+            for i in range(5):
+                task = getattr(self, f"task_{i}", None)
+                if task is not None:
+                    self.tasks += [task]
+
+        # When slurm.py/launch.py processes a --yaml launcher-format YAML,
+        # nemo_run constructs SlurmConfig directly from the YAML dict, silently
+        # dropping the _factory_ key (it's not a SlurmConfig field) and leaving
+        # host=None. This crashes paramiko with TypeError when connecting.
+        # Detect by checking host is falsy and re-apply the registered
+        # "slurm_factory" as base defaults, overlaying any fields explicitly set
+        # in the YAML (identified by value != SlurmConfig dataclass default).
+        _lookup = self._factory_lookup or _FACTORY_REGISTRY
+        _default_factory = _lookup.get("slurm_factory")
+        if _default_factory is not None:
+            _yaml_path = _yaml_path_from_argv()
+            for _task_index, _task in enumerate(self.tasks):
+                _sc = _task.slurm_config
+                if _sc is None or not hasattr(_sc, "host"):
+                    continue
+                if _sc.host:  # already set — factory was called correctly
+                    continue
+                if not dataclasses.is_dataclass(_sc):
+                    continue
+                _base = _default_factory()
+                _explicit_fields = _explicit_slurm_fields_from_yaml(
+                    _yaml_path,
+                    f"task_{_task_index}",
+                )
+                for _f in dataclasses.fields(_sc):
+                    _val = getattr(_sc, _f.name)
+                    # Prefer raw YAML keys so explicit default-equal values
+                    # override env-backed factory defaults. Fall back to the
+                    # value heuristic for programmatically constructed tests.
+                    _dflt = _f.default if _f.default is not dataclasses.MISSING else None
+                    if _f.name == "host" and not _val:
+                        continue
+                    if (_explicit_fields is not None and _f.name in _explicit_fields) or (
+                        _explicit_fields is None and _val != _dflt
+                    ):
+                        setattr(_base, _f.name, _val)
+                _task.slurm_config = _base
+
+        if self.task_configs is not None:
+            lookup = self._factory_lookup or _FACTORY_REGISTRY
+            if lookup:
+                self.tasks += [
+                    create_task_from_yaml(yaml_file=yf, factory_lookup=lookup)
+                    for yf in self.task_configs
+                ]
+
+        if self.global_vars is not None:
+            global_vars_dict = {
+                k: v for k, v in dataclasses.asdict(self.global_vars).items() if v is not None
+            }
+
+            def _resolve(s):
+                """Replace <<global_vars.X>> with the corresponding value."""
+                if not isinstance(s, str):
+                    return s
+                return re.sub(
+                    r"<<global_vars\.(\w+)>>",
+                    lambda m: global_vars_dict.get(m.group(1), m.group(0)),
+                    s,
+                )
+
+            for task in self.tasks:
+                if task.environment:
+                    if isinstance(task.environment, list):
+                        task.environment = [
+                            {k: _resolve(v) for k, v in item.items()} for item in task.environment
+                        ]
+                    else:
+                        task.environment = {k: _resolve(v) for k, v in task.environment.items()}
+                if task.args:
+                    task.args = [_resolve(a) for a in task.args]
+                if task.inline:
+                    task.inline = _resolve(task.inline)
+                if task.reqs:
+                    task.reqs = _resolve(task.reqs)
+                if task.reqs_file:
+                    task.reqs_file = _resolve(task.reqs_file)
+
+
+# ---------------------------------------------------------------------------
+# Executor builders
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class _ControlMasterSession:
+    """Minimal Fabric-like session backed by an OpenSSH ControlMaster socket."""
+
+    user: str
+    host: str
+    port: int
+    sock_path: str
+    pre_command: str | None = None
+    connect_kwargs: dict | None = None
+    is_connected: bool = True
+
+    def _ssh_opts(self) -> list[str]:
+        return [
+            "-o",
+            f"ControlPath={self.sock_path}",
+            "-o",
+            "ControlMaster=no",
+            "-o",
+            "BatchMode=yes",
+            "-o",
+            "StrictHostKeyChecking=accept-new",
+        ]
+
+    def run(self, command: str, hide: bool = True, warn: bool = False, **kwargs):
+        if self.pre_command:
+            command = f"{self.pre_command} && {command}"
+        proc = subprocess.run(  # nosec B603 B607 - fixed ssh argv, no shell.
+            [
+                "ssh",
+                "-p",
+                str(self.port or 22),
+                *self._ssh_opts(),
+                f"{self.user}@{self.host}",
+                command,
+            ],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if proc.returncode != 0 and not warn:
+            raise RuntimeError(
+                f"Remote command failed (exit {proc.returncode}):\n"
+                f"  cmd: {command}\n"
+                f"  stderr: {proc.stderr.strip()}"
+            )
+        return SimpleNamespace(
+            stdout=proc.stdout,
+            stderr=proc.stderr,
+            exited=proc.returncode,
+            command=command,
+        )
+
+    def local(self, command: str, hide: bool = True, warn: bool = False, **kwargs):
+        command = self._inject_controlmaster_rsh(command)
+        proc = subprocess.run(  # nosec B603 - shlex-split NeMo Run command, no shell.
+            shlex.split(command),
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if proc.returncode != 0 and not warn:
+            raise RuntimeError(
+                f"Local command failed (exit {proc.returncode}):\n"
+                f"  cmd: {command}\n"
+                f"  stderr: {proc.stderr.strip()}"
+            )
+        return SimpleNamespace(
+            stdout=proc.stdout,
+            stderr=proc.stderr,
+            exited=proc.returncode,
+            command=command,
+        )
+
+    def _inject_controlmaster_rsh(self, command: str) -> str:
+        if not command.startswith("rsync ") or "--rsh='ssh " not in command:
+            return command
+        opts = " ".join(map(shlex.quote, self._ssh_opts()))
+        return command.replace("--rsh='ssh ", f"--rsh='ssh {opts} ", 1)
+
+    def close(self) -> None:
+        self.is_connected = False
+
+
+class ControlMasterSSHTunnel(run.SSHTunnel):
+    """SSHTunnel variant that reuses an existing OpenSSH ControlMaster socket."""
+
+    def _control_socket_path(self) -> str | None:
+        value = os.environ.get("MODELOPT_LAUNCHER_SSH_CONTROL_PATH")
+        return os.path.expanduser(value) if value else None
+
+    def _has_live_controlmaster(self) -> bool:
+        sock_path = self._control_socket_path()
+        if not sock_path or not os.path.exists(sock_path):
+            return False
+        try:
+            proc = subprocess.run(  # nosec B603 B607 - fixed ssh argv, no shell.
+                [
+                    "ssh",
+                    "-p",
+                    str(int(getattr(self, "port", 22) or 22)),
+                    "-O",
+                    "check",
+                    "-o",
+                    f"ControlPath={sock_path}",
+                    f"{self.user}@{self.host}",
+                ],
+                capture_output=True,
+                text=True,
+                timeout=15,
+                check=False,
+            )
+        except subprocess.TimeoutExpired:
+            return False
+        return proc.returncode == 0
+
+    def _raise_reauth_required(self) -> None:
+        reconnect = os.environ.get("MODELOPT_LAUNCHER_SSH_RECONNECT_COMMAND") or "ssh"
+        raise RuntimeError(
+            "mfa_reauth_required: an active OpenSSH ControlMaster socket is "
+            f"required at {self._control_socket_path()}. Run `{reconnect}`, "
+            "keep it connected, then retry this submission."
+        )
+
+    def connect(self):
+        """Attach nemo-run to an already-authenticated OpenSSH ControlMaster session."""
+        if self._has_live_controlmaster():
+            self.session = _ControlMasterSession(
+                user=self.user,
+                host=self.host,
+                port=int(getattr(self, "port", 22) or 22),
+                sock_path=self._control_socket_path() or "",
+                pre_command=self.pre_command,
+                connect_kwargs={},
+            )
+            return
+        self._raise_reauth_required()
+
+
+def build_slurm_executor(
+    user,
+    identity,
+    slurm_config,
+    experiment_id,
+    job_dir,
+    task_name,
+    packager,
+    modelopt_src_path=None,
+    experiment_title="cicd",
+):
+    """Build a SlurmExecutor for remote job submission."""
+    container_mounts = list(slurm_config.container_mounts or [])
+
+    scratch_dst = "/scratchspace"
+    scratch_src = f"{job_dir}/{experiment_title}/{experiment_id}"
+    container_mounts += [
+        f"{scratch_src}:{scratch_dst}",
+        f"{job_dir}/{experiment_title}:/{experiment_title}",
+    ]
+    if modelopt_src_path:
+        modelopt_dst = slurm_config.modelopt_install_path
+        modelopt_src = (
+            f"{job_dir}/{experiment_title}/{experiment_id}"
+            f"/{task_name}/code/modules/Model-Optimizer/modelopt"
+        )
+        modelopt_recipes_dst = os.path.join(
+            os.path.dirname(os.path.normpath(slurm_config.modelopt_install_path)),
+            "modelopt_recipes",
+        )
+        modelopt_recipes_src = (
+            f"{job_dir}/{experiment_title}/{experiment_id}"
+            f"/{task_name}/code/modules/Model-Optimizer/modelopt_recipes"
+        )
+        container_mounts += [
+            f"{modelopt_src}:{modelopt_dst}",
+            f"{modelopt_recipes_src}:{modelopt_recipes_dst}",
+        ]
+
+    # When launching from a login node inside the cluster (host is localhost),
+    # use a LocalTunnel: nemo_run then runs sbatch and copies artifacts via local
+    # subprocess/shutil instead of ssh+rsync. This avoids flaky/hanging ssh-to-
+    # localhost (e.g. MaxStartups throttling on a shared login node, or clusters
+    # only reachable through a login proxy so paramiko can't tunnel in from
+    # outside). For real remote hosts, keep the SSHTunnel.
+    if slurm_config.host in ("localhost", "127.0.0.1"):
+        tunnel = run.LocalTunnel(job_dir=job_dir)
+    else:
+        tunnel_cls = (
+            ControlMasterSSHTunnel
+            if os.environ.get("MODELOPT_LAUNCHER_SSH_CONTROL_PATH")
+            else run.SSHTunnel
+        )
+        tunnel = tunnel_cls(
+            host=slurm_config.host,
+            user=user or getattr(slurm_config, "user", None) or getpass.getuser(),
+            port=slurm_config.port,
+            job_dir=job_dir,
+            identity=identity,
+        )
+
+    # --segment=<N>: pin all nodes into one topology block (one NVL72 / NVLink domain).
+    # getattr (not attribute access) keeps older/custom SlurmConfig types patched in via
+    # set_slurm_config_type that predate the `segment` field from raising AttributeError.
+    # None -> omit the kwarg entirely so the scheduler places freely (default behavior).
+    optional_kwargs = {}
+    segment = getattr(slurm_config, "segment", None)
+    if segment is not None:
+        optional_kwargs["segment"] = segment
+
+    executor = run.SlurmExecutor(
+        account=slurm_config.account,
+        partition=slurm_config.partition,
+        qos=slurm_config.qos,
+        ntasks_per_node=slurm_config.ntasks_per_node,
+        gpus_per_node=slurm_config.gpus_per_node,
+        nodes=slurm_config.nodes,
+        tunnel=tunnel,
+        container_image=slurm_config.container,
+        container_mounts=container_mounts,
+        array=slurm_config.array,
+        time=slurm_config.time,
+        mem=getattr(slurm_config, "mem", None) or "0",
+        retries=0,
+        packager=packager,
+        srun_args=slurm_config.srun_args,
+        # Copy into a fresh dict so the requeue mutation below doesn't leak back into
+        # the shared slurm_config.additional_parameters.
+        additional_parameters=dict(getattr(slurm_config, "additional_parameters", None) or {}),
+        **optional_kwargs,
+    )
+    if getattr(slurm_config, "requeue", False):
+        executor.additional_parameters["requeue"] = True
+        # The nemo-run sbatch wrapper only calls `scontrol requeue` when
+        # TORCHX_MAX_RETRIES > SLURM_RESTART_COUNT.  retries=0 (the default)
+        # disables this, so bump it when requeue is requested.
+        executor.retries = max(executor.retries, 3)
+    return executor
+
+
+def build_docker_executor(
+    hf_local,
+    slurm_config,
+    experiment_id,
+    job_dir,
+    task_name,
+    packager,
+    modelopt_src_path=None,
+    experiment_title="cicd",
+):
+    """Build a DockerExecutor for local GPU jobs."""
+    if slurm_config.local:
+        container_mounts = list(slurm_config.container_mounts or [])
+    else:
+        container_mounts = []
+    container_mounts += [f"{hf_local}:/hf-local"]
+
+    scratch_dst = "/scratchspace"
+    scratch_src = os.path.join(job_dir, experiment_title, experiment_id)
+    os.makedirs(scratch_src, exist_ok=True)
+    modelopt_dst = slurm_config.modelopt_install_path
+    if modelopt_src_path is None:
+        modelopt_src_path = os.path.join(os.getcwd(), "modules/Model-Optimizer/modelopt")
+    modelopt_recipes_dst = os.path.join(
+        os.path.dirname(os.path.normpath(slurm_config.modelopt_install_path)),
+        "modelopt_recipes",
+    )
+    modelopt_recipes_src_path = os.path.join(os.path.dirname(modelopt_src_path), "modelopt_recipes")
+    exp_title_src = os.path.join(job_dir, experiment_title)
+    os.makedirs(exp_title_src, exist_ok=True)
+    container_mounts += [
+        f"{scratch_src}:{scratch_dst}",
+        f"{modelopt_src_path}:{modelopt_dst}",
+        f"{modelopt_recipes_src_path}:{modelopt_recipes_dst}",
+        f"{exp_title_src}:/{experiment_title}",
+    ]
+
+    # Default to host uid:gid so artifacts aren't root-owned; docker_user="root"
+    # lets a job read root-only image paths (e.g. /opt/Megatron-Bridge in NeMo).
+    docker_user = getattr(slurm_config, "docker_user", None) or f"{os.getuid()}:{os.getgid()}"
+    executor = run.DockerExecutor(
+        num_gpus=-1,
+        runtime="nvidia",
+        ipc_mode="host",
+        container_image=slurm_config.container,
+        volumes=container_mounts,
+        additional_kwargs={"user": docker_user, "entrypoint": ""},
+        packager=packager,
+    )
+    return executor
+
+
+# ---------------------------------------------------------------------------
+# Version reporting
+# ---------------------------------------------------------------------------
+
+
+def _git_info(path):
+    """Get git commit hash and branch for a directory."""
+    try:
+        worktree_dir = os.path.abspath(path)
+        while True:
+            git_path = os.path.join(worktree_dir, ".git")
+            if os.path.isdir(git_path):
+                git_dir = git_path
+                break
+            if os.path.isfile(git_path):
+                with open(git_path, encoding="utf-8") as file:
+                    marker = file.read().strip()
+                if not marker.startswith("gitdir:"):
+                    return "unknown", "unknown"
+                git_dir = marker.removeprefix("gitdir:").strip()
+                if not os.path.isabs(git_dir):
+                    git_dir = os.path.normpath(os.path.join(worktree_dir, git_dir))
+                break
+
+            parent = os.path.dirname(worktree_dir)
+            if parent == worktree_dir:
+                return "unknown", "unknown"
+            worktree_dir = parent
+
+        common_dir = git_dir
+        commondir_path = os.path.join(git_dir, "commondir")
+        if os.path.exists(commondir_path):
+            with open(commondir_path, encoding="utf-8") as file:
+                common_dir = file.read().strip()
+            if not os.path.isabs(common_dir):
+                common_dir = os.path.normpath(os.path.join(git_dir, common_dir))
+
+        with open(os.path.join(git_dir, "HEAD"), encoding="utf-8") as file:
+            head = file.read().strip()
+        if not head.startswith("ref:"):
+            return head[:7], "HEAD"
+
+        ref = head.removeprefix("ref:").strip()
+        branch = ref.removeprefix("refs/heads/")
+        commit = ""
+        for refs_dir in (git_dir, common_dir):
+            ref_path = os.path.join(refs_dir, *ref.split("/"))
+            if os.path.exists(ref_path):
+                with open(ref_path, encoding="utf-8") as file:
+                    commit = file.read().strip()
+                break
+
+        if not commit:
+            packed_refs = os.path.join(common_dir, "packed-refs")
+            if os.path.exists(packed_refs):
+                with open(packed_refs, encoding="utf-8") as file:
+                    for line in file:
+                        if line.startswith(("#", "^")):
+                            continue
+                        sha, _, packed_ref = line.strip().partition(" ")
+                        if packed_ref == ref:
+                            commit = sha
+                            break
+        return (commit[:7] if commit else "unknown"), branch
+    except OSError:
+        return "unknown", "unknown"
+
+
+def report_versions(base_dir):
+    """Print git commit and branch for the launcher and all submodules."""
+    print("=" * 60)
+    print("Version Report")
+    print("=" * 60)
+
+    # Launcher / repo root
+    commit, branch = _git_info(base_dir)
+    print(f"  {'Launcher':<30} {commit:<12} ({branch})")
+
+    # Submodules
+    modules_dir = os.path.join(base_dir, "modules")
+    if os.path.isdir(modules_dir):
+        for name in sorted(os.listdir(modules_dir)):
+            sub_path = os.path.join(modules_dir, name)
+            if os.path.exists(os.path.join(sub_path, ".git")):
+                commit, branch = _git_info(sub_path)
+                print(f"  {name:<30} {commit:<12} ({branch})")
+
+    print("=" * 60)
+
+
+# ---------------------------------------------------------------------------
+# Shared job run loop
+# ---------------------------------------------------------------------------
+
+
+def run_jobs(
+    job_table,
+    hf_local,
+    user,
+    identity,
+    job_dir,
+    packager,
+    default_slurm_env,
+    default_local_env,
+    experiment_title="cicd",
+    detach=False,
+    test_level=0,
+    modelopt_src_path=None,
+    base_dir=None,
+):
+    """Run all jobs in job_table.
+
+    Args:
+        job_table: Dict mapping job_name -> SandboxPipeline.
+        hf_local: Path to local HF cache (None for remote Slurm).
+        user: SSH user.
+        identity: SSH identity file.
+        job_dir: Base directory for job artifacts.
+        packager: PatternPackager instance.
+        default_slurm_env: Default env vars for Slurm jobs.
+        default_local_env: Default env vars for local Docker jobs.
+        experiment_title: Experiment title (e.g., "cicd" or "modelopt").
+        detach: Whether to detach from the experiment.
+        test_level: Only run jobs with test_level <= this value.
+        modelopt_src_path: Path to modelopt source for Docker mounts.
+        base_dir: Base directory for version reporting (default: cwd).
+    """
+    report_versions(base_dir or os.getcwd())
+
+    for job_name, job in job_table.items():
+        if job.test_level > test_level:
+            job.skip = True
+        if job.skip:
+            continue
+
+        dependency = None
+        exp = run.Experiment(experiment_title, log_level="INFO")
+        job.experiment = exp
+
+        with exp:
+            for task_id, task in enumerate(job.tasks):
+                if task.skip:
+                    print(f"job {job_name} task {task_id}: skipped")
+                    continue
+                task_name = f"{job_name}_{task_id}"
+                task_args = [] if task.args is None else task.args
+                if bool(task.script) == bool(task.inline):
+                    raise ValueError(f"{task_name}: set exactly one of `script` or `inline`.")
+                if task.inline and task_args:
+                    raise ValueError(
+                        f"{task_name}: `args` is only for `script`; put them in the `inline` command."
+                    )
+
+                task_env = {}
+                if task.environment is not None:
+                    if isinstance(task.environment, list):
+                        for item in task.environment:
+                            task_env.update(item.items())
+                    else:
+                        task_env = task.environment
+                for k, v in task_env.items():
+                    task_env[k] = "" if v is None else str(v)
+
+                if hf_local is not None:
+                    executor = build_docker_executor(
+                        hf_local,
+                        task.slurm_config,
+                        exp._id,
+                        job_dir,
+                        task_name,
+                        packager,
+                        modelopt_src_path,
+                        experiment_title,
+                    )
+                    task_env.update(default_local_env)
+                else:
+                    executor = build_slurm_executor(
+                        user,
+                        identity,
+                        task.slurm_config,
+                        exp._id,
+                        job_dir,
+                        task_name,
+                        packager,
+                        modelopt_src_path,
+                        experiment_title,
+                    )
+                    task_env.update(default_slurm_env)
+
+                # When allow_to_fail is set, use "afterany" so downstream tasks
+                # run even if a predecessor times out or fails.
+                if job.allow_to_fail and hasattr(executor, "dependency_type"):
+                    executor.dependency_type = "afterany"
+
+                # Optional reqs: pip-install before the command. reqs_file is a
+                # requirements.txt path; reqs is a raw arg string (shlex-quoted so
+                # < > = are literal, letting YAMLs write it unquoted).
+                reqs_prefix = ""
+                if task.reqs or task.reqs_file:
+                    pkgs = ["-r", shlex.quote(task.reqs_file)] if task.reqs_file else []
+                    pkgs += [shlex.quote(tok) for tok in shlex.split(task.reqs or "")]
+                    install = "python -m pip install " + " ".join(pkgs)
+                    # On Slurm, srun runs this inline on every rank (ntasks_per_node), so install
+                    # once per node on local rank 0 behind a filesystem barrier — concurrent pip on
+                    # one node corrupts the env. The marker lives in the working dir (/nemo_run/code,
+                    # the shared job dir), so its name folds in job/step/node IDs: per-step avoids
+                    # reusing a stale marker from an earlier task in the same experiment, and
+                    # per-node stops another node's rank 0 from satisfying this node's barrier. Local
+                    # rank 0 installs and touches the marker; the other local ranks wait for it and
+                    # fail (final `[ -f ]`) if it never appears (rank-0 install error). Local
+                    # single-process runs just install as rank 0 and never wait.
+                    marker = (
+                        ".modelopt_launcher_reqs_done_"
+                        "${SLURM_JOB_ID:-0}_${SLURM_STEP_ID:-0}_${SLURM_NODEID:-0}"
+                    )
+                    reqs_prefix = (
+                        f'if [ "${{SLURM_LOCALID:-0}}" -eq 0 ]; then '
+                        f"{install} && touch {marker}; "
+                        f"else for _ in $(seq 600); do [ -f {marker} ] && break; sleep 1; done; "
+                        f"[ -f {marker} ]; fi && "
+                    )
+                if task.inline:
+                    task_instance = run.Script(inline=reqs_prefix + task.inline, env=task_env)
+                elif reqs_prefix:  # reqs + script path: wrap the bash call inline
+                    # Quote the script path; task_args keep the launcher's shell-word-split
+                    # convention (a "--flag value" item expands to two args), as run.Script does.
+                    script_cmd = " ".join(["bash", shlex.quote(task.script), *task_args])
+                    task_instance = run.Script(inline=reqs_prefix + script_cmd, env=task_env)
+                else:
+                    task_instance = run.Script(task.script, args=task_args, env=task_env)
+                print(f"job {job_name} task {task_id} slurm_config: {task.slurm_config}")
+
+                if dependency is None:
+                    dependency = exp.add(
+                        task_instance, tail_logs=True, name=task_name, executor=executor
+                    )
+                else:
+                    dependency = exp.add(
+                        task_instance,
+                        tail_logs=True,
+                        name=task_name,
+                        executor=executor,
+                        dependencies=[dependency],
+                    )
+
+            exp.run(detach=detach)
+
+        # Write metadata for downstream tools
+        metadata = {
+            "experiment_id": exp._id,
+            "job_name": job_name,
+            "allow_to_fail": job.allow_to_fail,
+            "note": job.note,
+        }
+        metadata_path = os.path.join("experiments", experiment_title, exp._id, "metadata.json")
+        os.makedirs(os.path.dirname(metadata_path), exist_ok=True)
+        with open(metadata_path, "w") as f:
+            json.dump(metadata, f)

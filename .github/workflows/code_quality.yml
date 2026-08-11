@@ -1,0 +1,32 @@
+name: Code Quality
+
+on:
+  pull_request:
+    branches: [main, release/*, feature/*]
+  schedule:
+    - cron: "0 0 * * *" # Nightly
+  workflow_dispatch:
+    # On-demand
+
+
+concurrency:
+  # Cancel previous runs if new commit is pushed to the same PR
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.sha }}
+  cancel-in-progress: true
+
+jobs:
+  code-quality:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v6
+      - uses: ./.github/actions/ubuntu-setup
+      - name: Secret Scanning
+        uses: trufflesecurity/trufflehog@v3.90.5
+        with:
+          # Exclude lob: its `(live|test)_[a-zA-Z0-9_]{35}` pattern matches any pytest function
+          # whose name happens to be exactly 35 characters after `test_`, and it reports them as
+          # verified. Only nightly sees them, since it scans all history while PRs scan their diff.
+          extra_args: --results=verified,unknown --exclude-detectors=lob
+      - name: Run code quality checks
+        run: pip install nox uv && nox -s pre_commit_all

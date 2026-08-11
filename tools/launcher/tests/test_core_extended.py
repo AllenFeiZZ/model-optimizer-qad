@@ -1,0 +1,488 @@
+# SPDX-FileCopyrightText: Copyright (c) 2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# ruff: noqa: D102
+"""Extended tests for launcher/core.py — edge cases and remaining coverage gaps.
+
+Coverage:
+    - create_task_from_yaml: error cases (missing factory, bad YAML)
+    - SandboxPipeline: dict environment (not list), task_configs with registry fallback
+    - _git_info: direct tests for success and failure
+    - run_jobs: environment merging (list vs dict), test_level filtering, pipeline skip,
+      detach flag, version report
+"""
+
+import os
+from unittest.mock import MagicMock, patch
+
+import core
+import pytest
+from core import (
+    GlobalVariables,
+    SandboxPipeline,
+    SandboxTask,
+    SandboxTask0,
+    _git_info,
+    create_task_from_yaml,
+    get_default_env,
+    run_jobs,
+)
+from slurm_config import SlurmConfig
+
+
+class TestCreateTaskFromYamlErrors:
+    """Error handling in create_task_from_yaml."""
+
+    def test_missing_factory_raises(self, tmp_yaml):
+        yaml_content = """
+script: test.sh
+slurm_config:
+  _factory_: "nonexistent_factory"
+  nodes: 1
+"""
+        path = tmp_yaml(yaml_content)
+        with pytest.raises(KeyError):
+            create_task_from_yaml(path, factory_lookup={})
+
+    def test_missing_slurm_config_raises(self, tmp_yaml):
+        yaml_content = """
+script: test.sh
+"""
+        path = tmp_yaml(yaml_content)
+        with pytest.raises((KeyError, TypeError)):
+            create_task_from_yaml(path, factory_lookup={})
+
+    def test_environment_preserved(self, tmp_yaml):
+        def factory(nodes=1):
+            return {"nodes": nodes}
+
+        yaml_content = """
+script: test.sh
+environment:
+  - KEY1: val1
+  - KEY2: val2
+slurm_config:
+  _factory_: "f"
+  nodes: 1
+"""
+        path = tmp_yaml(yaml_content)
+        task = create_task_from_yaml(path, factory_lookup={"f": factory})
+        assert task.environment == [{"KEY1": "val1"}, {"KEY2": "val2"}]
+
+
+class TestSandboxPipelineExtended:
+    """Extended SandboxPipeline tests."""
+
+    def test_dict_environment_interpolation(self):
+        """Global vars resolve in dict-format environment (not list)."""
+        t0 = SandboxTask0(
+            script="test.sh",
+            environment={"MODEL": "<<global_vars.hf_model>>", "STATIC": "value"},
+        )
+        pipeline = SandboxPipeline(
+            task_0=t0,
+            global_vars=GlobalVariables(hf_model="/hf-local/model"),
+        )
+        assert pipeline.tasks[0].environment == {
+            "MODEL": "/hf-local/model",
+            "STATIC": "value",
+        }
+
+    def test_tasks_list_directly(self):
+        """Pipeline can receive tasks as a list directly."""
+        tasks = [
+            SandboxTask(script="a.sh"),
+            SandboxTask(script="b.sh"),
+            SandboxTask(script="c.sh"),
+        ]
+        pipeline = SandboxPipeline(tasks=tasks)
+        assert len(pipeline.tasks) == 3
+        assert pipeline.tasks[2].script == "c.sh"
+
+    def test_no_global_vars_no_error(self):
+        """Pipeline without global_vars doesn't crash on interpolation."""
+        t0 = SandboxTask0(
+            script="test.sh",
+            args=["<<global_vars.hf_model>>"],
+        )
+        pipeline = SandboxPipeline(task_0=t0)
+        # No interpolation happens — args kept as-is
+        assert pipeline.tasks[0].args == ["<<global_vars.hf_model>>"]
+
+    def test_slurm_repair_preserves_explicit_nullable_gpus(self, monkeypatch):
+        """Inline --yaml repair keeps factory host and explicit no-GRES value."""
+
+        def factory():
+            return SlurmConfig(host="cluster.example.com", gpus_per_node=1)
+
+        monkeypatch.setitem(core._FACTORY_REGISTRY, "slurm_factory", factory)
+
+        task = SandboxTask0(
+            script="test.sh",
+            slurm_config=SlurmConfig(
+                host=None,
+                container="ubuntu:24.04",
+                gpus_per_node=None,
+            ),
+        )
+        pipeline = SandboxPipeline(task_0=task)
+
+        assert pipeline.tasks[0].slurm_config.host == "cluster.example.com"
+        assert pipeline.tasks[0].slurm_config.container == "ubuntu:24.04"
+        assert pipeline.tasks[0].slurm_config.gpus_per_node is None
+
+    def test_slurm_repair_uses_raw_yaml_keys_for_default_equal_values(self, monkeypatch, tmp_yaml):
+        """Inline --yaml repair preserves explicit values equal to dataclass defaults."""
+
+        def factory():
+            return SlurmConfig(
+                host="cluster.example.com",
+                partition="factory_partition",
+                gpus_per_node=1,
+            )
+
+        yaml_path = tmp_yaml(
+            """
+job_name: smoke
+pipeline:
+  task_0:
+    script: hostname.sh
+    slurm_config:
+      _factory_: slurm_factory
+      partition: batch
+      gpus_per_node:
+"""
+        )
+        monkeypatch.setattr(core.sys, "argv", ["launch.py", "--yaml", yaml_path])
+        monkeypatch.setitem(core._FACTORY_REGISTRY, "slurm_factory", factory)
+
+        task = SandboxTask0(
+            script="hostname.sh",
+            slurm_config=SlurmConfig(host=None, partition="batch", gpus_per_node=None),
+        )
+        pipeline = SandboxPipeline(task_0=task)
+
+        assert pipeline.tasks[0].slurm_config.host == "cluster.example.com"
+        assert pipeline.tasks[0].slurm_config.partition == "batch"
+        assert pipeline.tasks[0].slurm_config.gpus_per_node is None
+
+
+class TestGitInfo:
+    """Direct tests for _git_info helper."""
+
+    def test_valid_git_repo(self):
+        commit, branch = _git_info(os.getcwd())
+        assert commit != "unknown"
+        assert branch != "unknown"
+        assert len(commit) >= 7  # short hash
+
+    def test_valid_git_repo_from_nested_directory(self):
+        commit, branch = _git_info(os.path.join(os.getcwd(), "tests"))
+        assert commit != "unknown"
+        assert branch != "unknown"
+        assert len(commit) >= 7  # short hash
+
+    def test_nonexistent_directory(self):
+        commit, branch = _git_info("/tmp/nonexistent_xyz_12345")
+        assert commit == "unknown"
+        assert branch == "unknown"
+
+    def test_non_git_directory(self):
+        # Use /tmp which is outside any git repo
+        commit, branch = _git_info("/tmp")
+        # /tmp may or may not be inside a git worktree depending on the system
+        # Just verify it returns strings without crashing
+        assert isinstance(commit, str)
+        assert isinstance(branch, str)
+
+
+class TestRunJobsExtended:
+    """Extended run_jobs tests for env merging, test_level, and detach."""
+
+    @patch("core.run.Experiment")
+    @patch("core.build_docker_executor")
+    def test_environment_list_merged_to_env(self, mock_docker, mock_exp, tmp_path):
+        """List-of-dicts environment is merged into task_env."""
+        mock_exp_inst = MagicMock()
+        mock_exp_inst._id = "exp_env"
+        mock_exp_inst.__enter__ = MagicMock(return_value=mock_exp_inst)
+        mock_exp_inst.__exit__ = MagicMock(return_value=False)
+        mock_exp.return_value = mock_exp_inst
+        mock_docker.return_value = MagicMock()
+
+        slurm_env, local_env = get_default_env()
+
+        t0 = SandboxTask0(
+            script="test.sh",
+            slurm_config=MagicMock(),
+            environment=[{"A": "1"}, {"B": "2"}],
+        )
+        pipeline = SandboxPipeline(task_0=t0)
+
+        with patch("core.run.Script") as mock_script:
+            run_jobs(
+                job_table={"job": pipeline},
+                hf_local="/tmp/hf",
+                user="u",
+                identity=None,
+                job_dir=str(tmp_path),
+                packager=MagicMock(),
+                default_slurm_env=slurm_env,
+                default_local_env=local_env,
+                base_dir=str(tmp_path),
+            )
+            # Script called with merged env
+            call_kwargs = mock_script.call_args[1]
+            assert "A" in call_kwargs["env"]
+            assert "B" in call_kwargs["env"]
+            assert call_kwargs["env"]["A"] == "1"
+
+    @patch("core.run.Experiment")
+    @patch("core.build_docker_executor")
+    def test_none_env_values_converted_to_empty_string(self, mock_docker, mock_exp, tmp_path):
+        mock_exp_inst = MagicMock()
+        mock_exp_inst._id = "exp_none"
+        mock_exp_inst.__enter__ = MagicMock(return_value=mock_exp_inst)
+        mock_exp_inst.__exit__ = MagicMock(return_value=False)
+        mock_exp.return_value = mock_exp_inst
+        mock_docker.return_value = MagicMock()
+
+        slurm_env, local_env = get_default_env()
+
+        t0 = SandboxTask0(
+            script="test.sh",
+            slurm_config=MagicMock(),
+            environment=[{"KEY": None}],
+        )
+        pipeline = SandboxPipeline(task_0=t0)
+
+        with patch("core.run.Script") as mock_script:
+            run_jobs(
+                job_table={"job": pipeline},
+                hf_local="/tmp/hf",
+                user="u",
+                identity=None,
+                job_dir=str(tmp_path),
+                packager=MagicMock(),
+                default_slurm_env=slurm_env,
+                default_local_env=local_env,
+                base_dir=str(tmp_path),
+            )
+            env = mock_script.call_args[1]["env"]
+            assert env["KEY"] == ""
+
+    @patch("core.run.Experiment")
+    @patch("core.build_docker_executor")
+    def test_test_level_filters_pipeline(self, mock_docker, mock_exp, tmp_path):
+        """Pipelines with test_level > current are skipped."""
+        mock_exp_inst = MagicMock()
+        mock_exp_inst._id = "exp_lvl"
+        mock_exp_inst.__enter__ = MagicMock(return_value=mock_exp_inst)
+        mock_exp_inst.__exit__ = MagicMock(return_value=False)
+        mock_exp.return_value = mock_exp_inst
+        mock_docker.return_value = MagicMock()
+
+        slurm_env, local_env = get_default_env()
+
+        t0 = SandboxTask0(script="test.sh", slurm_config=MagicMock())
+        pipeline = SandboxPipeline(task_0=t0, test_level=2)
+
+        run_jobs(
+            job_table={"job": pipeline},
+            hf_local="/tmp/hf",
+            user="u",
+            identity=None,
+            job_dir=str(tmp_path),
+            packager=MagicMock(),
+            default_slurm_env=slurm_env,
+            default_local_env=local_env,
+            test_level=0,  # lower than pipeline's test_level=2
+            base_dir=str(tmp_path),
+        )
+
+        # Experiment should not be created for skipped pipelines
+        mock_exp.assert_not_called()
+
+    @patch("core.run.Experiment")
+    @patch("core.build_docker_executor")
+    def test_skipped_pipeline_not_run(self, mock_docker, mock_exp, tmp_path):
+        slurm_env, local_env = get_default_env()
+
+        t0 = SandboxTask0(script="test.sh", slurm_config=MagicMock())
+        pipeline = SandboxPipeline(task_0=t0, skip=True)
+
+        run_jobs(
+            job_table={"job": pipeline},
+            hf_local="/tmp/hf",
+            user="u",
+            identity=None,
+            job_dir=str(tmp_path),
+            packager=MagicMock(),
+            default_slurm_env=slurm_env,
+            default_local_env=local_env,
+            base_dir=str(tmp_path),
+        )
+
+        mock_exp.assert_not_called()
+
+    @patch("core.run.Experiment")
+    @patch("core.build_docker_executor")
+    def test_detach_flag_passed_to_experiment(self, mock_docker, mock_exp, tmp_path):
+        mock_exp_inst = MagicMock()
+        mock_exp_inst._id = "exp_detach"
+        mock_exp_inst.__enter__ = MagicMock(return_value=mock_exp_inst)
+        mock_exp_inst.__exit__ = MagicMock(return_value=False)
+        mock_exp.return_value = mock_exp_inst
+        mock_docker.return_value = MagicMock()
+
+        slurm_env, local_env = get_default_env()
+
+        t0 = SandboxTask0(script="test.sh", slurm_config=MagicMock())
+        pipeline = SandboxPipeline(task_0=t0)
+
+        run_jobs(
+            job_table={"job": pipeline},
+            hf_local="/tmp/hf",
+            user="u",
+            identity=None,
+            job_dir=str(tmp_path),
+            packager=MagicMock(),
+            default_slurm_env=slurm_env,
+            default_local_env=local_env,
+            detach=True,
+            base_dir=str(tmp_path),
+        )
+
+        mock_exp_inst.run.assert_called_once_with(detach=True)
+
+    @patch("core.run.Experiment")
+    @patch("core.build_docker_executor")
+    def test_version_report_called(self, mock_docker, mock_exp, tmp_path, capsys):
+        mock_exp_inst = MagicMock()
+        mock_exp_inst._id = "exp_ver"
+        mock_exp_inst.__enter__ = MagicMock(return_value=mock_exp_inst)
+        mock_exp_inst.__exit__ = MagicMock(return_value=False)
+        mock_exp.return_value = mock_exp_inst
+        mock_docker.return_value = MagicMock()
+
+        slurm_env, local_env = get_default_env()
+
+        t0 = SandboxTask0(script="test.sh", slurm_config=MagicMock())
+        pipeline = SandboxPipeline(task_0=t0)
+
+        run_jobs(
+            job_table={"job": pipeline},
+            hf_local="/tmp/hf",
+            user="u",
+            identity=None,
+            job_dir=str(tmp_path),
+            packager=MagicMock(),
+            default_slurm_env=slurm_env,
+            default_local_env=local_env,
+            base_dir=str(tmp_path),
+        )
+
+        captured = capsys.readouterr()
+        assert "Version Report" in captured.out
+
+    @patch("core.run.Experiment")
+    @patch("core.build_docker_executor")
+    def test_reqs_inline_barrier(self, mock_docker, mock_exp, tmp_path):
+        """`reqs` on an inline task shlex-quotes pins and wraps the pip barrier."""
+        mock_exp_inst = MagicMock()
+        mock_exp_inst._id = "exp_reqs_inline"
+        mock_exp_inst.__enter__ = MagicMock(return_value=mock_exp_inst)
+        mock_exp_inst.__exit__ = MagicMock(return_value=False)
+        mock_exp.return_value = mock_exp_inst
+        mock_docker.return_value = MagicMock()
+
+        slurm_env, local_env = get_default_env()
+
+        t0 = SandboxTask0(
+            script=None,
+            inline="python eval.py",
+            slurm_config=MagicMock(),
+            reqs="transformers<5 fire",
+        )
+        pipeline = SandboxPipeline(task_0=t0)
+
+        with patch("core.run.Script") as mock_script:
+            run_jobs(
+                job_table={"job": pipeline},
+                hf_local="/tmp/hf",
+                user="u",
+                identity=None,
+                job_dir=str(tmp_path),
+                packager=MagicMock(),
+                default_slurm_env=slurm_env,
+                default_local_env=local_env,
+                base_dir=str(tmp_path),
+            )
+            inline = mock_script.call_args[1]["inline"]
+
+        # `<` and `>` are shlex-quoted so the shell treats them literally.
+        assert "python -m pip install 'transformers<5' fire" in inline
+        # Local rank 0 installs; other ranks wait on a per-job/step/node marker.
+        assert '[ "${SLURM_LOCALID:-0}" -eq 0 ]' in inline
+        marker = (
+            ".modelopt_launcher_reqs_done_${SLURM_JOB_ID:-0}_${SLURM_STEP_ID:-0}_${SLURM_NODEID:-0}"
+        )
+        assert f"touch {marker}" in inline
+        assert f"[ -f {marker} ]" in inline
+        assert "rm -f" not in inline  # unique marker name means no pre-clear needed
+        # The task's own command runs after the barrier (`&&`).
+        assert inline.rstrip().endswith("python eval.py")
+
+    @patch("core.run.Experiment")
+    @patch("core.build_docker_executor")
+    def test_reqs_script_wrapped_inline(self, mock_docker, mock_exp, tmp_path):
+        """`reqs` on a script task wraps `bash <script> <args>` inline behind the barrier."""
+        mock_exp_inst = MagicMock()
+        mock_exp_inst._id = "exp_reqs_script"
+        mock_exp_inst.__enter__ = MagicMock(return_value=mock_exp_inst)
+        mock_exp_inst.__exit__ = MagicMock(return_value=False)
+        mock_exp.return_value = mock_exp_inst
+        mock_docker.return_value = MagicMock()
+
+        slurm_env, local_env = get_default_env()
+
+        t0 = SandboxTask0(
+            script="run.sh",
+            slurm_config=MagicMock(),
+            args=["--flag value"],
+            reqs="fire",
+        )
+        pipeline = SandboxPipeline(task_0=t0)
+
+        with patch("core.run.Script") as mock_script:
+            run_jobs(
+                job_table={"job": pipeline},
+                hf_local="/tmp/hf",
+                user="u",
+                identity=None,
+                job_dir=str(tmp_path),
+                packager=MagicMock(),
+                default_slurm_env=slurm_env,
+                default_local_env=local_env,
+                base_dir=str(tmp_path),
+            )
+            call_kwargs = mock_script.call_args[1]
+
+        inline = call_kwargs["inline"]
+        assert "python -m pip install fire" in inline
+        # "--flag value" keeps the shell-word-split convention (expands to two args).
+        assert inline.rstrip().endswith("bash run.sh --flag value")
+        # Wrapped inline: no separate script/args kwargs.
+        assert "args" not in call_kwargs or not call_kwargs.get("args")

@@ -1,0 +1,34 @@
+# Conservative QAD gate after the 1e-5 / 10-step smoke worsened held-out KL.
+model_name_or_path: ${QAD_FAKEQUANT_MODEL}
+output_dir: ${QAD_OUTPUT_DIR}
+attn_implementation: flash_attention_2
+
+distill: true
+teacher_model: ${QAD_TEACHER_MODEL}
+criterion: logits_loss
+temperature: 1.0
+
+dataset_config: ${QAD_RESOLVED_DATASET_CONFIG}
+train_samples: 224
+eval_samples: 16
+
+max_steps: 50
+learning_rate: 1.0e-6
+per_device_train_batch_size: 1
+per_device_eval_batch_size: 1
+gradient_accumulation_steps: 1
+model_max_length: 2048
+warmup_ratio: 0.0
+lr_scheduler_type: constant
+use_liger_kernel: false
+manual_gc: true
+seed: 42
+do_train: true
+do_eval: false
+eval_strategy: 'no'
+
+gradient_checkpointing: false
+save_strategy: 'no'
+logging_steps: 1
+report_to:
+  - tensorboard

@@ -1,0 +1,32 @@
+# ModelOpt PTQ recipe matching the deployment contract used in the Slime run:
+# Qwen2.5 layers 0-23 MLP W4A4 NVFP4, attention and layers 24-27 BF16,
+# and BF16 KV cache.
+
+imports:
+  base_disable_all: configs/ptq/units/base_disable_all
+  default_disabled_quantizers: configs/ptq/units/default_disabled_quantizers
+  nvfp4: configs/numerics/nvfp4
+
+metadata:
+  recipe_type: ptq
+  description: Qwen2.5 dense MLP layers 0-23 NVFP4; attention, last four layers, and KV BF16.
+
+quantize:
+  algorithm: max
+  quant_cfg:
+    - $import: base_disable_all
+    - quantizer_name: '*mlp*weight_quantizer'
+      cfg:
+        $import: nvfp4
+    - quantizer_name: '*mlp*input_quantizer'
+      cfg:
+        $import: nvfp4
+    - quantizer_name: '*layers.24.mlp*'
+      enable: false
+    - quantizer_name: '*layers.25.mlp*'
+      enable: false
+    - quantizer_name: '*layers.26.mlp*'
+      enable: false
+    - quantizer_name: '*layers.27.mlp*'
+      enable: false
+    - $import: default_disabled_quantizers

@@ -1,0 +1,113 @@
+name: GPU tests
+
+on:
+  push:
+    branches: ["pull-request/[0-9]+"]
+    # NOTE: paths cannot be used since push happens to copied PR and only latest commit to PR is used
+  schedule:
+    - cron: "0 0 * * *" # Nightly
+  workflow_dispatch:
+    # On-demand
+
+concurrency:
+  # Cancel previous runs if new commit is pushed to the same PR
+  group: ${{ github.workflow }}-${{ startsWith(github.ref, 'refs/heads/pull-request/') && github.ref || github.sha }}
+  cancel-in-progress: true
+
+jobs:
+  pr-gate:
+    uses: ./.github/workflows/_pr_gate.yml
+    permissions:
+      checks: read
+    secrets: inherit
+    with:
+      files: |
+        .github/actions/**
+        .github/workflows/_pr_gate.yml
+        .github/workflows/gpu_tests.yml
+        modelopt/**
+        modelopt_recipes/**
+        noxfile.py
+        pyproject.toml
+        tests/_test_utils/**
+        tests/conftest.py
+        tests/gpu/**
+        tests/gpu_megatron/**
+        tests/gpu_trtllm/**
+        tests/gpu_vllm/**
+
+  gpu-tests:
+    needs: [pr-gate]
+    if: needs.pr-gate.outputs.any_changed == 'true'
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - example: gpu
+            timeout: 60
+            # Pinned to 26.05: benchmark.py uses trt.NetworkDefinitionCreationFlag.EXPLICIT_BATCH,
+            # which newer TensorRT (26.06) removed. Bump once the source is updated for TensorRT 10.
+            container_image: nvcr.io/nvidia/pytorch:26.05-py3
+          - example: gpu_megatron
+            timeout: 60
+            container_image: nvcr.io/nvidia/nemo:26.06
+          - example: gpu_trtllm
+            timeout: 15
+            container_image: nvcr.io/nvidia/tensorrt-llm/release:1.3.0rc20
+          # Covers the RoutedExperts layout (0.24+)
+          - example: gpu_vllm
+            timeout: 15
+            container_image: docker.io/vllm/vllm-openai:v0.26.0
+          # Covers the legacy FusedMoE / SharedFusedMoE registration branches (vLLM < 0.24)
+          - example: gpu_vllm
+            timeout: 15
+            container_image: docker.io/vllm/vllm-openai:v0.20.0
+    runs-on: ${{ startsWith(github.ref, 'refs/heads/pull-request/') && 'linux-amd64-gpu-rtxpro6000-latest-1' || 'linux-amd64-gpu-rtxpro6000-latest-2' }}
+    timeout-minutes: ${{ matrix.timeout }}
+    container:
+      image: ${{ matrix.container_image }}
+      env:
+        GIT_DEPTH: 1000 # For correct version
+        PIP_CONSTRAINT: "" # Disable pip constraint for upgrading packages
+        HF_TOKEN: ${{ secrets.HF_TOKEN }}
+        # Build CUDA kernels only for the runner's RTX PRO 6000 (sm_120), not the image's ~6 archs.
+        TORCH_CUDA_ARCH_LIST: "12.0"
+    steps:
+      - name: Install git
+        # The vllm container ships without git; needed for a real checkout (correct
+        # setuptools-scm version) and for the Codecov upload below.
+        if: matrix.example == 'gpu_vllm'
+        run: apt-get update && apt-get install -y git
+      - uses: actions/checkout@v6
+      - uses: nv-gha-runners/setup-proxy-cache@main
+      - uses: ./.github/actions/cache-extensions
+        with:
+          cache-key: rtxpro6000-${{ matrix.container_image }}
+      - name: Setup environment variables
+        run: |
+          echo "LD_LIBRARY_PATH=${LD_LIBRARY_PATH}:/usr/include:/usr/lib/x86_64-linux-gnu" >> $GITHUB_ENV
+      - name: Run gpu tests
+        env:
+          COVERAGE_PROCESS_START: ${{ github.workspace }}/pyproject.toml
+          COVERAGE_FILE: ${{ github.workspace }}/.coverage
+        run: |
+          # Use `python3` (the vllm image has no `python` on PATH)
+          python3 -m pip install nox && nox -s ${{ matrix.example }}
+      - name: Upload GPU coverage to Codecov
+        uses: codecov/codecov-action@v5
+        with:
+          token: ${{ secrets.CODECOV_TOKEN }}
+          files: coverage.xml
+          flags: gpu
+          fail_ci_if_error: false # test may be skipped if relevant file changes are not detected
+          verbose: true
+
+  gpu-pr-required-check:
+    # Run even if gpu-tests is skipped
+    if: ${{ startsWith(github.ref, 'refs/heads/pull-request/') && always() }}
+    needs: [pr-gate, gpu-tests]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Required GPU tests did not succeed
+        if: ${{ needs.pr-gate.result != 'success' || (needs.pr-gate.outputs.any_changed == 'true' && needs.gpu-tests.result != 'success') }}
+        run: exit 1

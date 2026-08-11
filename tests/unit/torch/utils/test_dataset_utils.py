@@ -1,0 +1,920 @@
+# SPDX-FileCopyrightText: Copyright (c) 2023-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+import json
+from unittest.mock import Mock, patch
+
+import pytest
+import torch
+from torch.utils.data import DataLoader
+
+from modelopt.torch.utils import dataset_utils
+from modelopt.torch.utils.dataset_utils import (
+    DATASET_COMBOS,
+    _disable_use_cache,
+    _forward_loop,
+    _iter_use_cache_configs,
+    _pack_documents_into_rows,
+    _process_batch,
+    get_dataset_dataloader,
+    get_dataset_samples,
+    get_max_batch_size,
+    prepare_messages_for_chat_template,
+)
+
+
+def test_prepare_messages_for_chat_template():
+    messages = [
+        {
+            "role": "assistant",
+            "content": "answer",
+            "reasoning_content": "think",
+            "tool_calls": [
+                {"function": {"name": "search", "arguments": '{"q": "x"}'}},
+            ],
+        },
+    ]
+    prepared = prepare_messages_for_chat_template(
+        messages, reasoning_content="native", normalize_tool_calls=True
+    )
+    assert prepared[0]["reasoning_content"] == "think"
+    assert prepared[0]["tool_calls"][0]["function"]["arguments"] == {"q": "x"}
+    assert (
+        prepare_messages_for_chat_template(
+            messages, reasoning_content="native", normalize_tool_calls=False
+        )
+        is messages
+    )
+
+
+def setup_test_data():
+    # Create sample batch data
+    batch_data = {
+        "input_ids": torch.ones((8, 512), dtype=torch.long),
+        "attention_mask": torch.ones((8, 512), dtype=torch.long),
+    }
+
+    # Create a mock inference method that raises OOM for batch sizes > 2
+    def mock_infer(**kwargs):
+        batch_size = kwargs["input_ids"].shape[0]
+        if batch_size > 2:
+            raise torch.cuda.OutOfMemoryError
+
+    return batch_data, mock_infer
+
+
+def test_successful_processing():
+    _, mock_infer = setup_test_data()
+
+    # Test with small batch that shouldn't trigger OOM
+    small_batch = {
+        "input_ids": torch.ones((2, 512), dtype=torch.long),
+        "attention_mask": torch.ones((2, 512), dtype=torch.long),
+    }
+
+    # Should complete without raising any exceptions
+    assert _process_batch(small_batch, mock_infer) == 2
+
+
+def test_oom_splitting():
+    batch_data, mock_infer = setup_test_data()
+
+    # Mock to track calls to the inference method
+    mock_infer_spy = Mock(side_effect=mock_infer)
+
+    # Process a batch that will trigger OOM and force splitting
+    assert _process_batch(batch_data, mock_infer_spy) == 2
+
+    # The batch should be split multiple times until processable sizes are reached
+    # With initial batch size 8, splits occur:
+    # 8 -> OOM
+    # 4,4 -> OOM for the first 4
+    # 2,2,2,2 -> Success
+    # Total calls: 1 (initial) + 1 (size 4) + 4 (size 2) = 6
+    assert mock_infer_spy.call_count == 6
+
+
+def test_oom_with_single_sample():
+    # Test handling of OOM with batch size 1
+    single_batch = {
+        "input_ids": torch.ones((1, 512), dtype=torch.long),
+        "attention_mask": torch.ones((1, 512), dtype=torch.long),
+    }
+
+    def mock_infer_always_oom(**kwargs):
+        raise torch.cuda.OutOfMemoryError
+
+    # Should raise assertion error since can't split batch size 1
+    with pytest.raises(AssertionError):
+        _process_batch(single_batch, mock_infer_always_oom)
+
+
+def test_batch_contents_preserved():
+    # Create batch with distinct values to verify splitting preserves data
+    batch_data = {
+        "input_ids": torch.arange(4).view(4, 1),
+        "attention_mask": torch.ones((4, 1), dtype=torch.long),
+    }
+
+    processed_values = []
+
+    def mock_infer_collect(**kwargs):
+        if kwargs["input_ids"].shape[0] > 2:
+            raise torch.cuda.OutOfMemoryError
+        processed_values.extend(kwargs["input_ids"].flatten().tolist())
+
+    _process_batch(batch_data, mock_infer_collect)
+
+    # Verify all values were processed in the correct order
+    assert processed_values == [0, 1, 2, 3]
+
+
+def test_process_batch_allowed_non_tensor_keys_accepted():
+    """Non-tensor values under allowed_non_tensor_keys should not raise."""
+    batch_data = {
+        "input_ids": torch.ones((2, 8), dtype=torch.long),
+        "base_model_outputs": [{"hidden_states": torch.zeros(2, 8, 16)}],  # non-tensor
+    }
+
+    def mock_infer(**kwargs):
+        pass
+
+    # Should not raise
+    _process_batch(batch_data, mock_infer, allowed_non_tensor_keys={"base_model_outputs"})
+
+
+def test_process_batch_non_tensor_without_allowlist_raises():
+    """Non-tensor values without allowlist should raise AssertionError."""
+    batch_data = {
+        "input_ids": torch.ones((2, 8), dtype=torch.long),
+        "base_model_outputs": [{"hidden_states": torch.zeros(2, 8, 16)}],
+    }
+
+    def mock_infer(**kwargs):
+        pass
+
+    with pytest.raises(AssertionError):
+        _process_batch(batch_data, mock_infer)
+
+
+def test_process_batch_other_keys_still_validated():
+    """Non-tensor values under non-allowed keys should still raise even with allowlist set."""
+    batch_data = {
+        "input_ids": torch.ones((2, 8), dtype=torch.long),
+        "unexpected_key": "some_string",  # not in allowed list
+    }
+
+    def mock_infer(**kwargs):
+        pass
+
+    with pytest.raises(AssertionError):
+        _process_batch(batch_data, mock_infer, allowed_non_tensor_keys={"base_model_outputs"})
+
+
+class _Config:
+    """Minimal config stand-in; instances start with no `use_cache` attribute."""
+
+
+def test_disable_use_cache_no_config_attr():
+    """Model without a `config` attribute: CM is a no-op and does not raise."""
+    model = torch.nn.Linear(4, 4)
+    assert not hasattr(model, "config")
+
+    with _disable_use_cache(model):
+        assert not hasattr(model, "config")
+
+    assert not hasattr(model, "config")
+
+
+@pytest.mark.parametrize("prev_value", [True, False])
+def test_disable_use_cache_with_existing_attr(prev_value):
+    """Config that already has `use_cache`: forced to False inside, restored on exit."""
+    model = torch.nn.Linear(4, 4)
+    model.config = _Config()
+    model.config.use_cache = prev_value
+
+    with _disable_use_cache(model):
+        assert model.config.use_cache is False
+
+    assert model.config.use_cache is prev_value
+
+
+def test_disable_use_cache_without_existing_attr():
+    """Config that lacks `use_cache`: set to False inside, attribute removed on exit (no leak)."""
+    model = torch.nn.Linear(4, 4)
+    model.config = _Config()
+    assert not hasattr(model.config, "use_cache")
+
+    with _disable_use_cache(model):
+        assert model.config.use_cache is False
+
+    assert not hasattr(model.config, "use_cache")
+
+
+@pytest.mark.parametrize("prev_value", [True, False])
+def test_disable_use_cache_with_nested_text_config_existing_attr(prev_value):
+    """Nested text config `use_cache` is disabled and restored."""
+    model = torch.nn.Linear(4, 4)
+    model.config = _Config()
+    model.config.text_config = _Config()
+    model.config.text_config.use_cache = prev_value
+
+    with _disable_use_cache(model):
+        assert model.config.use_cache is False
+        assert model.config.text_config.use_cache is False
+
+    assert not hasattr(model.config, "use_cache")
+    assert model.config.text_config.use_cache is prev_value
+
+
+def test_disable_use_cache_with_nested_text_config_without_existing_attr():
+    """Nested text config `use_cache` is removed if it was added by the context."""
+    model = torch.nn.Linear(4, 4)
+    model.config = _Config()
+    model.config.text_config = _Config()
+
+    with _disable_use_cache(model):
+        assert model.config.use_cache is False
+        assert model.config.text_config.use_cache is False
+
+    assert not hasattr(model.config, "use_cache")
+    assert not hasattr(model.config.text_config, "use_cache")
+
+
+def test_iter_use_cache_configs_deduplicates_text_config_alias():
+    """The same config object is patched once if `config.text_config is config`."""
+    model = torch.nn.Linear(4, 4)
+    model.config = _Config()
+    model.config.text_config = model.config
+
+    assert list(_iter_use_cache_configs(model)) == [model.config]
+
+
+def test_forward_loop_runs_under_disabled_use_cache():
+    """`_forward_loop` runs forward on every batch and restores `use_cache` on exit."""
+    seen_use_cache: list[bool] = []
+
+    class _Model(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.config = _Config()
+            self.config.use_cache = True
+
+        def forward(self, **kwargs):
+            seen_use_cache.append(self.config.use_cache)
+
+    model = _Model()
+
+    def _collate(samples):
+        return {"input_ids": torch.stack([s["input_ids"] for s in samples])}
+
+    data = [{"input_ids": torch.zeros(8, dtype=torch.long)} for _ in range(3)]
+    loader = DataLoader(data, batch_size=1, collate_fn=_collate)
+
+    _forward_loop(model, loader)
+
+    assert seen_use_cache == [False, False, False]
+    assert model.config.use_cache is True
+
+
+def test_disable_use_cache_restores_on_exception():
+    """Restore must run even if the with-block raises."""
+    model = torch.nn.Linear(4, 4)
+    model.config = _Config()
+    model.config.use_cache = True
+
+    with pytest.raises(RuntimeError, match="boom"), _disable_use_cache(model):
+        assert model.config.use_cache is False
+        raise RuntimeError("boom")
+
+    assert model.config.use_cache is True
+
+
+def test_get_max_batch_size_oom_retry_shrinks_input():
+    """On OOM, target_input must be re-expanded to the halved batch size.
+
+    Regression test: previously target_input was built once and never shrunk,
+    so OOM retries kept feeding the same too-large tensor to infer_method.
+    """
+    seq_len = 8
+    sample_input = torch.ones((1, seq_len), dtype=torch.int32)
+
+    seen_batch_sizes: list[int] = []
+
+    def fake_call(x):
+        seen_batch_sizes.append(x.shape[0])
+        # First call is the single-batch probe — succeeds.
+        # Second call is the target-batch attempt — OOMs.
+        # Third call (after halving) — succeeds.
+        if len(seen_batch_sizes) == 2:
+            raise torch.cuda.OutOfMemoryError
+
+    model = Mock(spec=torch.nn.Module)
+    # get_max_batch_size calls the module (model(...)) so FSDP2 hooks fire, not model.forward,
+    # so route the mock's __call__ via side_effect.
+    model.side_effect = fake_call
+    model.__class__.__name__ = "DummyModel"  # not enc/dec
+
+    free_before = 1000
+    free_after = 900  # 100 bytes per batch -> target = 1000/100 = 10
+
+    device_props = Mock()
+    device_props.total_memory = 10**12
+
+    with (
+        patch("torch.cuda.empty_cache"),
+        patch("torch.cuda.get_device_properties", return_value=device_props),
+        patch("torch.cuda.device_count", return_value=1),
+        patch("torch.cuda.mem_get_info", side_effect=[(free_before, 0), (free_after, 0)]),
+        patch("torch.cuda.max_memory_allocated", side_effect=[0, 0]),
+    ):
+        result = get_max_batch_size(
+            model,
+            max_sample_length=seq_len,
+            sample_input_single_batch=sample_input,
+        )
+
+    # Model calls: probe(1), retry-at-target(10), retry-after-halve(5)
+    assert seen_batch_sizes == [1, 10, 5]
+    # Final batch is 5 -> regulated to 4 (5 // 4 * 4 = 4).
+    assert result == 4
+
+
+def test_get_dataset_samples_with_unsupported_dataset(make_toy_hf_dataset):
+    """A dataset not in ``SUPPORTED_DATASET_CONFIG`` loads via the auto-detect path."""
+    dataset_name = make_toy_hf_dataset()  # basename never matches a registered key
+
+    samples = get_dataset_samples(dataset_name, num_samples=5)
+
+    assert isinstance(samples, list)
+    assert len(samples) == 5
+    assert all(isinstance(s, str) and len(s) > 0 for s in samples)
+
+
+# ---------------------------------------------------------------------------
+# Local JSONL loading — must flow through the same auto-preprocess path as a
+# downloaded HF dataset, so chat / prompt / text columns are all handled.
+# ---------------------------------------------------------------------------
+
+
+def _write_jsonl(path, rows):
+    """Write a list of dicts to *path* as JSONL. Returns the path as ``str``."""
+
+    with open(path, "w", encoding="utf-8") as f:
+        f.writelines(json.dumps(row) + "\n" for row in rows)
+    return str(path)
+
+
+@pytest.fixture
+def chat_tokenizer():
+    """Mock tokenizer whose ``apply_chat_template`` joins messages role:content."""
+    tok = Mock()
+    tok.apply_chat_template = Mock(
+        side_effect=lambda msgs, tokenize=False, **kw: " | ".join(
+            f"{m['role']}:{m['content']}" for m in msgs
+        )
+    )
+    return tok
+
+
+class TestLocalJsonlLoading:
+    """Local ``.jsonl`` paths route through HF's ``json`` builder + auto-preprocess."""
+
+    def test_text_column(self, tmp_path):
+        pytest.importorskip("datasets")
+        path = _write_jsonl(
+            tmp_path / "plain.jsonl",
+            [{"text": f"plain {i}"} for i in range(3)],
+        )
+        samples = get_dataset_samples(path, num_samples=3)
+        assert samples == ["plain 0", "plain 1", "plain 2"]
+
+    def test_messages_column_uses_chat_template(self, tmp_path, chat_tokenizer):
+        pytest.importorskip("datasets")
+        path = _write_jsonl(
+            tmp_path / "chat.jsonl",
+            [
+                {
+                    "messages": [
+                        {"role": "user", "content": f"hello {i}"},
+                        {"role": "assistant", "content": f"hi {i}"},
+                    ]
+                }
+                for i in range(3)
+            ],
+        )
+        samples = get_dataset_samples(path, num_samples=3, tokenizer=chat_tokenizer)
+        assert len(samples) == 3
+        assert samples[0] == "user:hello 0 | assistant:hi 0"
+        # apply_chat_template must have been invoked once per sample
+        assert chat_tokenizer.apply_chat_template.call_count == 3
+
+    def test_conversations_column_uses_chat_template(self, tmp_path, chat_tokenizer):
+        """Auto-detect also recognizes ``conversations`` (Magpie-style)."""
+        pytest.importorskip("datasets")
+        path = _write_jsonl(
+            tmp_path / "convs.jsonl",
+            [
+                {
+                    "conversations": [
+                        {"role": "user", "content": "q"},
+                        {"role": "assistant", "content": "a"},
+                    ]
+                }
+            ],
+        )
+        samples = get_dataset_samples(path, num_samples=1, tokenizer=chat_tokenizer)
+        assert samples == ["user:q | assistant:a"]
+
+    def test_prompt_completion_concatenated(self, tmp_path):
+        pytest.importorskip("datasets")
+        path = _write_jsonl(
+            tmp_path / "prompt.jsonl",
+            [{"prompt": "Q?", "completion": "A."}],
+        )
+        samples = get_dataset_samples(path, num_samples=1)
+        assert samples == ["Q?\nA."]
+
+    def test_input_output_concatenated(self, tmp_path):
+        pytest.importorskip("datasets")
+        path = _write_jsonl(
+            tmp_path / "io.jsonl",
+            [{"input": "in", "output": "out"}],
+        )
+        samples = get_dataset_samples(path, num_samples=1)
+        assert samples == ["in\nout"]
+
+    def test_num_samples_honored(self, tmp_path):
+        """Loads only the requested number of rows even when the file is larger."""
+        pytest.importorskip("datasets")
+        path = _write_jsonl(
+            tmp_path / "many.jsonl",
+            [{"text": f"row {i}"} for i in range(100)],
+        )
+        samples = get_dataset_samples(path, num_samples=5)
+        assert len(samples) == 5
+        assert samples == [f"row {i}" for i in range(5)]
+
+    def test_tools_forwarded_to_chat_template(self, tmp_path, chat_tokenizer):
+        """If a row carries a ``tools`` field, it's passed through to apply_chat_template."""
+        pytest.importorskip("datasets")
+        path = _write_jsonl(
+            tmp_path / "tools.jsonl",
+            [
+                {
+                    "messages": [{"role": "user", "content": "x"}],
+                    "tools": [{"name": "calc"}],
+                }
+            ],
+        )
+        get_dataset_samples(path, num_samples=1, tokenizer=chat_tokenizer)
+        _, kwargs = chat_tokenizer.apply_chat_template.call_args
+        assert kwargs.get("tools") == [{"name": "calc"}]
+
+    def test_unrecognized_columns_raise(self, tmp_path):
+        """Auto-detect raises ValueError when no recognized column is present.
+
+        The HF builder loads the rows fine; auto-detect rejects them. There's no
+        ``text`` field to fall back to, so the error propagates instead of being
+        masked by the legacy fallback.
+        """
+        pytest.importorskip("datasets")
+        path = _write_jsonl(
+            tmp_path / "bad.jsonl",
+            [{"unrelated_field": "value"}],
+        )
+        with pytest.raises(ValueError, match="Cannot auto-detect format"):
+            get_dataset_samples(path, num_samples=1)
+
+    def test_sparse_recognized_column_falls_through_to_text(self, tmp_path):
+        """Sparse ``prompt`` column (None on most rows) must not shadow ``text``.
+
+        HF's schema unification fills missing values with None across heterogeneous
+        rows, so a row with only ``text`` ends up exposing ``prompt=None`` in the
+        unified schema.  Auto-detect must skip null-valued recognized columns
+        rather than crash on ``"\\n".join([None])``.
+        """
+        pytest.importorskip("datasets")
+        rows = [
+            {"text": "row a"},
+            {"text": "row b", "prompt": "ignored", "completion": "stuff"},
+            {"text": "row c"},
+        ]
+        path = _write_jsonl(tmp_path / "sparse.jsonl", rows)
+        samples = get_dataset_samples(path, num_samples=3)
+        # text-only rows fall through to ``text``; the prompt-bearing row uses
+        # the prompt+completion path.
+        assert samples == ["row a", "ignored\nstuff", "row c"]
+
+    def test_empty_string_columns_treated_as_present(self, tmp_path):
+        """Empty strings are valid values, not absent columns.
+
+        ``prompt=""`` should still take the prompt path (caller filters empty
+        results downstream), and ``text=""`` rows must not crash the load —
+        only ``None`` should fall through to the next column.
+        """
+        pytest.importorskip("datasets")
+        rows = [
+            {"text": ""},  # blank but valid; caller drops empty samples
+            {"prompt": "", "completion": "from-completion"},
+            {"input": "", "output": "from-output"},
+            {"text": "kept"},
+        ]
+        path = _write_jsonl(tmp_path / "blank.jsonl", rows)
+        samples = get_dataset_samples(path, num_samples=4)
+        # ``{"text": ""}`` produces "" and is filtered by the caller.
+        # ``{"prompt": "", "completion": "from-completion"}`` joins to
+        # "\nfrom-completion". ``{"input": "", "output": "from-output"}``
+        # joins to "\nfrom-output".  ``{"text": "kept"}`` is kept verbatim.
+        assert samples == ["\nfrom-completion", "\nfrom-output", "kept"]
+
+    def test_empty_split_list_raises(self, tmp_path):
+        path = _write_jsonl(tmp_path / "plain.jsonl", [{"text": "row"}])
+        with pytest.raises(ValueError, match="at least one split name"):
+            get_dataset_samples(path, num_samples=1, split=[])
+
+    def test_legacy_text_fallback_on_hf_builder_failure(self, tmp_path, monkeypatch):
+        """If the HF json builder raises, fall back to the legacy text-field reader."""
+        datasets = pytest.importorskip("datasets")
+        from datasets.exceptions import DatasetGenerationError
+
+        rows = [
+            {"text": "row a", "meta": 1},
+            {"text": "row b", "meta": "two"},
+            {"text": "row c", "meta": 3},
+        ]
+        path = _write_jsonl(tmp_path / "mixed.jsonl", rows)
+        load_dataset_mock = Mock(side_effect=DatasetGenerationError("schema boom"))
+        monkeypatch.setattr(datasets, "load_dataset", load_dataset_mock)
+
+        with pytest.warns(UserWarning, match="fell back to legacy text-field reader"):
+            samples = get_dataset_samples(path, num_samples=3)
+
+        load_dataset_mock.assert_called_once()
+        assert samples == ["row a", "row b", "row c"]
+
+
+# ---------------------------------------------------------------------------
+# _pack_documents_into_rows — global-stream document packing
+# ---------------------------------------------------------------------------
+
+
+class _FakePackTokenizer:
+    """Tokenizer stub: encodes ``"N"`` → ``[50] * N`` so packed rows are inspectable.
+
+    EOS=99 and pad=0 are sentinel IDs distinct from doc tokens (=50).
+    """
+
+    eos_token_id = 99
+    pad_token_id = 0
+
+    def encode(self, s, add_special_tokens=False):
+        return [50] * int(s)
+
+
+def test_pack_documents_into_rows():
+    """Global-stream packing: all docs concatenated with EOS separators into one
+    token stream, then sliced into uniform-length rows. Non-final rows are fully
+    real (no pad); the final partial row (when the stream runs out) is padded.
+    """
+    tok = _FakePackTokenizer()
+    # Stream layout (cumulative position after each doc+EOS):
+    #   200 doc + EOS = 201  (positions 0-200)
+    #   100 doc + EOS = 302  (positions 201-301)
+    #    80 doc + EOS = 383  (positions 302-382)
+    #   300 doc + EOS = 684  (positions 383-683)
+    #   150 doc + EOS = 835  (positions 684-834)
+    # Sliced into seq=512 with num_rows=2:
+    #   Row 0 = stream[0:512]   — fully real
+    #   Row 1 = stream[512:835] + pad — partial (323 real, 189 pad)
+    ids, mask = _pack_documents_into_rows(
+        ["200", "100", "80", "300", "150"], tok, seq_length=512, num_rows=2
+    )
+
+    assert ids.shape == (2, 512) and mask.shape == (2, 512)
+    assert ids.dtype == torch.long and mask.dtype == torch.long
+
+    # Row 0: stream[0:512]. EOS at positions 200, 301, 382 (after docs 1-3).
+    # Doc 4 (300) starts at stream position 383 and runs through 682; row 0
+    # captures only its first 129 tokens (positions 383..511), all value 50.
+    assert (ids[0, :200] == 50).all() and ids[0, 200] == 99
+    assert (ids[0, 201:301] == 50).all() and ids[0, 301] == 99
+    assert (ids[0, 302:382] == 50).all() and ids[0, 382] == 99
+    assert (ids[0, 383:512] == 50).all()  # mid-doc-4 tail, no EOS in this slice
+    assert mask[0].sum() == 512  # row fully real, zero pad
+
+    # Row 1: stream[512:835] = 171 tokens (rest of doc 4) + EOS + 150 doc + EOS
+    # = 323 real tokens, rest padded.
+    assert (ids[1, :171] == 50).all() and ids[1, 171] == 99
+    assert (ids[1, 172:322] == 50).all() and ids[1, 322] == 99
+    assert (ids[1, 323:] == 0).all()
+    assert mask[1].sum() == 323
+
+
+# ---------------------------------------------------------------------------
+# get_dataset_dataloader — blending across multiple sources
+# ---------------------------------------------------------------------------
+
+
+class TestGetDatasetDataloaderBlending:
+    """``get_dataset_dataloader`` accepts a list of sources and concatenates them."""
+
+    def test_single_jsonl(self, tmp_path, tiny_tokenizer):
+        pytest.importorskip("datasets")
+        path = _write_jsonl(
+            tmp_path / "single.jsonl",
+            [{"text": f"row {i}"} for i in range(4)],
+        )
+        loader = get_dataset_dataloader(
+            dataset_name=path,
+            tokenizer=tiny_tokenizer,
+            batch_size=2,
+            num_samples=4,
+            max_sample_length=16,
+        )
+        batches = list(loader)
+        assert len(batches) == 2
+        assert batches[0]["input_ids"].shape[0] == 2
+        assert "attention_mask" in batches[0]
+
+    def test_list_of_jsonl_blends(self, tmp_path, tiny_tokenizer):
+        """Two local JSONL files concatenated into a single dataloader."""
+        pytest.importorskip("datasets")
+        a = _write_jsonl(tmp_path / "a.jsonl", [{"text": f"a{i}"} for i in range(3)])
+        b = _write_jsonl(tmp_path / "b.jsonl", [{"text": f"b{i}"} for i in range(2)])
+
+        loader = get_dataset_dataloader(
+            dataset_name=[a, b],
+            tokenizer=tiny_tokenizer,
+            batch_size=5,
+            num_samples=[3, 2],
+            max_sample_length=16,
+        )
+        batches = list(loader)
+        assert len(batches) == 1
+        assert batches[0]["input_ids"].shape[0] == 5
+
+    def test_mixed_formats_blended(self, tmp_path, tiny_tokenizer):
+        """Mixing a text-column JSONL with a prompt/completion JSONL — both should flow."""
+        pytest.importorskip("datasets")
+        plain = _write_jsonl(tmp_path / "plain.jsonl", [{"text": "hello"}])
+        pc = _write_jsonl(tmp_path / "pc.jsonl", [{"prompt": "Q?", "completion": "A."}])
+
+        loader = get_dataset_dataloader(
+            dataset_name=[plain, pc],
+            tokenizer=tiny_tokenizer,
+            batch_size=2,
+            num_samples=[1, 1],
+            max_sample_length=16,
+        )
+        batches = list(loader)
+        assert len(batches) == 1
+        assert batches[0]["input_ids"].shape[0] == 2
+
+    def test_length_mismatch_raises(self, tmp_path, tiny_tokenizer):
+        """``dataset_name`` and ``num_samples`` lists must align."""
+        pytest.importorskip("datasets")
+        a = _write_jsonl(tmp_path / "a.jsonl", [{"text": "x"}])
+        b = _write_jsonl(tmp_path / "b.jsonl", [{"text": "y"}])
+        with pytest.raises(AssertionError, match="same length"):
+            get_dataset_dataloader(
+                dataset_name=[a, b],
+                tokenizer=tiny_tokenizer,
+                num_samples=[1],
+                max_sample_length=16,
+            )
+
+
+def test_multi_source_pack_shuffles_to_avoid_dominance(monkeypatch, tiny_tokenizer):
+    """With ``pack=True`` and 2+ sources, samples are shuffled so a long-doc source
+    can't silently exhaust the row budget and drop the other sources.
+
+    Without shuffle, source A's 16x-oversampled docs would all come first in
+    ``all_samples`` and (with sufficient row consumption per doc) fill every row.
+    With the deterministic shuffle, both sources appear within the first
+    ``total_rows`` worth of consumed samples.
+    """
+
+    def _fake(name, num_sample, **_kwargs):
+        # Each sample is a short string identifying its source; the tokenizer
+        # will encode each into a few tokens.
+        return [f"{name}_doc{i}" for i in range(num_sample)]
+
+    monkeypatch.setattr(dataset_utils, "get_dataset_samples", _fake)
+
+    loader = get_dataset_dataloader(
+        dataset_name=["src_a", "src_b"],
+        tokenizer=tiny_tokenizer,
+        batch_size=4,
+        num_samples=[4, 4],
+        max_sample_length=64,
+        pack=True,
+    )
+    batches = list(loader)
+    # input_ids are present and shaped as (rows, seq_length)
+    all_ids = torch.cat([b["input_ids"] for b in batches], dim=0)
+    assert all_ids.shape[1] == 64
+    # Tokenize the source tags so we can check both sources appear in the packed rows
+    src_a_id = tiny_tokenizer("src_a", add_special_tokens=False).input_ids[0]
+    src_b_id = tiny_tokenizer("src_b", add_special_tokens=False).input_ids[0]
+    flat = all_ids.flatten().tolist()
+    assert src_a_id in flat, "source A tokens missing from packed rows"
+    assert src_b_id in flat, (
+        "source B tokens missing from packed rows — multi-source shuffle broken"
+    )
+
+
+class TestDatasetCombosExpansion:
+    """Combo names in ``--dataset`` fan out to their registered members.
+
+    The combo branch in ``get_dataset_dataloader`` is exercised by mocking
+    ``get_dataset_samples`` so we can assert the post-expansion (name, count)
+    sequence without hitting HF.
+    """
+
+    @staticmethod
+    def _record_calls(monkeypatch):
+        calls: list[tuple[str, int]] = []
+
+        def _fake(name, num_sample, **_kwargs):
+            calls.append((name, num_sample))
+            return [f"{name}-{i}" for i in range(num_sample)]
+
+        monkeypatch.setattr(dataset_utils, "get_dataset_samples", _fake)
+        return calls
+
+    def test_combo_expands_evenly(self, monkeypatch, tiny_tokenizer):
+        calls = self._record_calls(monkeypatch)
+        get_dataset_dataloader(
+            dataset_name="cnn_nemotron_v2_mix",
+            tokenizer=tiny_tokenizer,
+            num_samples=8,
+            batch_size=1,
+            max_sample_length=16,
+        )
+        members = DATASET_COMBOS["cnn_nemotron_v2_mix"]
+        assert calls == [(members[0], 4), (members[1], 4)]
+
+    def test_combo_remainder_distributed_to_earlier_members(self, monkeypatch, tiny_tokenizer):
+        calls = self._record_calls(monkeypatch)
+        get_dataset_dataloader(
+            dataset_name="nemotron-post-training-v3",
+            tokenizer=tiny_tokenizer,
+            num_samples=10,
+            batch_size=1,
+            max_sample_length=16,
+        )
+        members = DATASET_COMBOS["nemotron-post-training-v3"]
+        # 10 / 7 = 1 base, remainder 3 -> first 3 get +1
+        expected_counts = [2, 2, 2, 1, 1, 1, 1]
+        assert calls == list(zip(members, expected_counts))
+
+    def test_plain_and_combo_compose(self, monkeypatch, tiny_tokenizer):
+        calls = self._record_calls(monkeypatch)
+        get_dataset_dataloader(
+            dataset_name=["cnn_dailymail", "nemotron-post-training-v3"],
+            tokenizer=tiny_tokenizer,
+            num_samples=[3, 7],
+            batch_size=1,
+            max_sample_length=16,
+        )
+        members = DATASET_COMBOS["nemotron-post-training-v3"]
+        assert calls == [("cnn_dailymail", 3)] + [(m, 1) for m in members]
+
+    def test_combo_overlapping_with_member_raises(self, monkeypatch, tiny_tokenizer):
+        self._record_calls(monkeypatch)
+        with pytest.raises(ValueError, match="combo 'cnn_nemotron_v2_mix'"):
+            get_dataset_dataloader(
+                dataset_name=["cnn_dailymail", "cnn_nemotron_v2_mix"],
+                tokenizer=tiny_tokenizer,
+                num_samples=[2, 4],
+                batch_size=1,
+                max_sample_length=16,
+            )
+
+    def test_get_dataset_samples_rejects_combo_name(self):
+        with pytest.raises(ValueError, match="DATASET_COMBOS"):
+            get_dataset_samples("cnn_nemotron_v2_mix", num_samples=1)
+
+
+# ---------------------------------------------------------------------------
+# Arbitrary-dataset round-trips. We build a tiny on-disk dataset directory
+# (``train``/``test`` parquet with a ``text`` column) and load it through the
+# same non-registered ``load_dataset(path=...)`` branch a downloaded HF dataset
+# would hit — keeping these unit tests fully offline rather than fetching
+# ``hf-internal-testing/*`` fixtures from the Hub.
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture(scope="module")
+def make_toy_hf_dataset(tmp_path_factory):
+    """Factory returning a local dataset-directory path with ``train``/``test`` splits."""
+    pytest.importorskip("datasets")
+    from datasets import Dataset
+
+    def _make(prefix: str = "toy", num_rows: int = 10) -> str:
+        d = tmp_path_factory.mktemp(prefix)
+        for split in ("train", "test"):
+            Dataset.from_dict(
+                {"text": [f"{prefix} {split} sample {i}" for i in range(num_rows)]}
+            ).to_parquet(str(d / f"{split}.parquet"))
+        return str(d)
+
+    return _make
+
+
+def _dump_dataset_to_jsonl(name: str, split: str, path) -> str:
+    from datasets import load_dataset
+
+    ds = load_dataset(name, split=split)
+    ds.to_json(str(path), lines=True)
+    return str(path)
+
+
+class TestLocalDatasetDirRoundTrips:
+    """End-to-end coverage of the auto-detected (non-registered) dataset path."""
+
+    def test_load_single_split_directly(self, make_toy_hf_dataset):
+        dataset = make_toy_hf_dataset()
+        samples = get_dataset_samples(dataset, num_samples=4, split="train")
+        assert len(samples) == 4
+        assert all(isinstance(s, str) and s for s in samples)
+
+    def test_load_multiple_splits_directly(self, make_toy_hf_dataset):
+        """``split=["train", "test"]`` divides ``num_samples`` across both splits."""
+        dataset = make_toy_hf_dataset()
+        samples = get_dataset_samples(dataset, num_samples=6, split=["train", "test"])
+        assert len(samples) == 6
+        # Default per-split is num_samples // n + remainder; for 6/2 → 3 from each.
+        # We can't assert exact origin without re-reading, but both splits should
+        # contribute, which we'll confirm by comparing against direct loads below.
+        train_only = set(get_dataset_samples(dataset, num_samples=10, split="train"))
+        test_only = set(get_dataset_samples(dataset, num_samples=10, split="test"))
+        assert any(s in train_only for s in samples)
+        assert any(s in test_only for s in samples)
+
+    def test_default_split_is_train(self, make_toy_hf_dataset):
+        dataset = make_toy_hf_dataset()
+        default_samples = get_dataset_samples(dataset, num_samples=4)
+        train_samples = get_dataset_samples(dataset, num_samples=4, split="train")
+        assert default_samples == train_samples
+
+    def test_zero_quota_split_is_not_loaded(self, monkeypatch, make_toy_hf_dataset):
+        """1 sample over 2 splits → quotas [0, 1]: the zero-quota split is never opened."""
+        datasets = pytest.importorskip("datasets")
+        loaded, real_load_dataset = [], datasets.load_dataset
+
+        def _spy(*args, **kwargs):
+            loaded.append(kwargs.get("split"))
+            return real_load_dataset(*args, **kwargs)
+
+        monkeypatch.setattr(datasets, "load_dataset", _spy)
+        get_dataset_samples(make_toy_hf_dataset(), num_samples=1, split=["train", "test"])
+        assert loaded == ["test"]
+
+    def test_download_to_jsonl_then_load(self, tmp_path, make_toy_hf_dataset):
+        """Dump the dataset to JSONL, then reload it via the local-jsonl path."""
+        dataset = make_toy_hf_dataset()
+        jsonl_path = _dump_dataset_to_jsonl(dataset, "train", tmp_path / "train.jsonl")
+        from_jsonl = get_dataset_samples(jsonl_path, num_samples=10)
+        from_dir = get_dataset_samples(dataset, num_samples=10, split="train")
+        assert from_jsonl == from_dir
+
+    def test_dataloader_blending_two_datasets(self, tiny_tokenizer, make_toy_hf_dataset):
+        """Two datasets concatenated via ``get_dataset_dataloader``."""
+        loader = get_dataset_dataloader(
+            dataset_name=[make_toy_hf_dataset("a"), make_toy_hf_dataset("b")],
+            tokenizer=tiny_tokenizer,
+            batch_size=4,
+            num_samples=[3, 1],
+            max_sample_length=16,
+        )
+        batches = list(loader)
+        assert sum(b["input_ids"].shape[0] for b in batches) == 4
+
+    def test_dataloader_mixing_dir_and_local_jsonl(
+        self, tmp_path, tiny_tokenizer, make_toy_hf_dataset
+    ):
+        """Dataset directory blended with a local synthetic JSONL file."""
+        local = _write_jsonl(tmp_path / "local.jsonl", [{"text": f"local {i}"} for i in range(2)])
+        loader = get_dataset_dataloader(
+            dataset_name=[make_toy_hf_dataset(), local],
+            tokenizer=tiny_tokenizer,
+            batch_size=5,
+            num_samples=[3, 2],
+            max_sample_length=16,
+        )
+        batches = list(loader)
+        assert sum(b["input_ids"].shape[0] for b in batches) == 5

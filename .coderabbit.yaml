@@ -1,0 +1,58 @@
+# Reference: https://docs.coderabbit.ai/getting-started/yaml-configuration
+language: "en-US"
+reviews:
+  profile: chill
+  collapse_walkthrough: true
+  poem: false
+  # Allow CodeRabbit to formally approve once its comments are resolved and pre-merge checks pass
+  request_changes_workflow: true
+  path_instructions:
+    - path: "modelopt/**/*.py"
+      instructions: &security_instructions |
+        Review all modelopt package and examples Python changes against the security coding practices in
+        SECURITY.md. Flag any of the following as CRITICAL security issues,
+        request changes, and fail the check if ANY are present:
+        1. torch.load(..., weights_only=False) with no inline comment justifying why it is safe
+           (e.g. confirming the file is internally-generated and not user-supplied).
+        2. numpy.load(..., allow_pickle=True) with no inline comment justifying why it is safe.
+           Should expose allow_pickle as a caller-configurable parameter defaulting to False, not hardcode True.
+        3. trust_remote_code=True hardcoded for transformers model or tokenizer loading.
+           Code should expose it as a caller-configurable parameter defaulting to False, not hardcode True.
+        4. eval() or exec() on any input that could originate from outside the process.
+        5. Any use of "# nosec" comments to bypass Bandit security checks is not allowed.
+           If a security-sensitive pattern is genuinely necessary, the PR must be reviewed and approved
+           by @NVIDIA/modelopt-setup-codeowners with an explicit justification in the PR description.
+        6. Any addition of new PIP dependencies in pyproject.toml or requirements.txt that are not
+           permissive licenses (e.g. MIT, Apache 2) must be reviewed and approved by
+           @NVIDIA/modelopt-setup-codeowners with an explicit justification in the PR description.
+    - path: "examples/**/*.py"
+      instructions: *security_instructions
+    - path: "tests/**/*.py"
+      instructions: |
+        Verify tests follow the conventions in CONTRIBUTING.md. Flag the following as
+        IMPORTANT issues:
+        1. Imports inside functions or test methods without explicit justification.
+           Imports belong at the top of the file so import errors surface at collection
+           time, not mid-test. The only acceptable in-function imports are for circular
+           imports or optional dependencies (e.g., TensorRT-LLM, Megatron-Core), and
+           those should carry a brief comment naming the reason.
+        2. Redundant lower-level tests that duplicate behavior already covered by a
+           higher-level test — checked-in tests should be lean and document expected
+           behavior, protect against regressions, or flag backward-incompatible changes.
+        3. Tests placed in the wrong directory for their cost profile (e.g., multi-minute
+           tests under tests/unit, which targets a few-seconds budget; GPU-requiring
+           tests under tests/unit instead of tests/gpu*).
+  auto_review:
+    auto_incremental_review: true
+    drafts: false
+    base_branches: ["main", "release/.*", "feature/.*"]
+  pre_merge_checks:
+    custom_checks:
+      - name: "Security anti-patterns"
+        mode: "error"
+        instructions: *security_instructions
+knowledge_base:
+  code_guidelines:
+    filePatterns:
+      - "CONTRIBUTING.md"
+      - "SECURITY.md"

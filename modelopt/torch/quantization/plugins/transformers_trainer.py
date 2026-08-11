@@ -1,0 +1,422 @@
+# SPDX-FileCopyrightText: Copyright (c) 2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""ModelOpt plugin for transformers Trainer."""
+
+import contextlib
+import gc
+import os
+import types
+import warnings
+from dataclasses import field
+
+import torch
+from tqdm import tqdm
+
+import modelopt.torch.opt as mto
+import modelopt.torch.quantization as mtq
+from modelopt.torch.distill.plugins.huggingface import KDTrainer
+from modelopt.torch.opt.plugins import ModelOptHFTrainer
+from modelopt.torch.opt.plugins.transformers import ModelOptHFArguments
+from modelopt.torch.utils import get_module_device, print_rank_0
+
+from ..nn import TensorQuantizer
+from ..utils import (
+    calibrate_with_adapters,
+    disable_lora_quantizers_in_config,
+    get_quantizer_state_dict,
+    is_quantized,
+    set_quantizer_state_dict,
+)
+
+# TODO: Enable documentation rendering for this class
+
+
+class QuantizationArguments(ModelOptHFArguments):
+    """Quantization arguments for ModelOpt Hugging Face trainer integrations."""
+
+    recipe: str | None = field(
+        default=None,
+        metadata={
+            "help": (
+                "Path to a quantization recipe YAML file (built-in or custom). "
+                "Built-in recipes can be specified by relative path, e.g. "
+                "'general/ptq/nvfp4_default-kv_fp8'. Replaces the deprecated --quant_cfg flag."
+            ),
+        },
+    )
+    quant_cfg: str | None = field(
+        default=None,
+        metadata={
+            "help": (
+                "Deprecated: pre-quantize the model with a separate quantization step instead. "
+                "Specify the quantization format for PTQ/QAT by name (e.g. NVFP4_DEFAULT_CFG)."
+            ),
+        },
+    )
+    calib_size: int = field(
+        default=512,
+        metadata={
+            "help": (
+                "Specify the calibration size for quantization. The calibration dataset is used to"
+                " setup the quantization scale parameters for PTQ/QAT."
+            )
+        },
+    )
+    compress: bool = field(
+        default=False,
+        metadata={
+            "help": (
+                "Whether to compress the model weights after quantization for QLoRA. "
+                "This is useful for reducing the model size."
+            )
+        },
+    )
+
+
+# Backwards-compat alias for the pre-refactor public name; remove in a future release.
+QuantizationArgumentsWithConfig = QuantizationArguments
+
+
+def resolve_quant_cfg_from_args(
+    quant_args: QuantizationArguments | None,
+    *,
+    warn_on_quant_cfg: bool = False,
+):
+    """Resolve a ModelOpt quantization config from recipe or legacy quant_cfg arguments."""
+    if quant_args is None:
+        return None
+
+    recipe_path = getattr(quant_args, "recipe", None)
+    if recipe_path:
+        from modelopt.recipe import ModelOptPTQRecipe, load_recipe
+
+        recipe = load_recipe(recipe_path)
+        if not isinstance(recipe, ModelOptPTQRecipe):
+            raise ValueError(
+                f"Expected PTQ recipe, but got {type(recipe).__name__} from {recipe_path}"
+            )
+        return recipe.quantize
+
+    quant_cfg = getattr(quant_args, "quant_cfg", None)
+    if quant_cfg is None:
+        return None
+    if warn_on_quant_cfg:
+        warnings.warn(
+            "In-trainer quantization via quant_args is deprecated and will be removed in a "
+            "future release. Pre-quantize your model with a separate quantization step instead.",
+            DeprecationWarning,
+            stacklevel=3,
+        )
+    return getattr(mtq, quant_cfg) if isinstance(quant_cfg, str) else quant_cfg
+
+
+def _patch_fsdp2_post_backward():
+    """Patch FSDP2 ``post_backward`` to handle mixed-precision gradient dtypes.
+
+    FSDP2 with bf16 mixed precision upcasts bf16 parameters to fp32 for optimizer
+    precision, while gradients are reduced in bf16. In PyTorch >= 2.6, assigning a
+    bf16 gradient to a fp32 parameter raises a ``RuntimeError`` due to the
+    ``grad_dtype`` check, and the fused Adam optimizer also rejects mixed dtypes.
+
+    This patch wraps ``FSDPParamGroup.post_backward`` to:
+    1. Set ``grad_dtype=None`` on sharded params before reduction (allowing bf16 assignment).
+    2. Cast gradients to match parameter dtype after reduction (so the optimizer sees matching dtypes).
+
+    .. note::
+        This is a workaround. The proper fix should come from PyTorch's FSDP2
+        ``foreach_reduce`` (which should cast gradients to match the parameter dtype)
+        or from accelerate (which should set ``grad_dtype`` when it upcasts params).
+        Remove this once the upstream fix is available.
+    """
+    try:
+        from torch.distributed.fsdp._fully_shard._fsdp_param_group import FSDPParamGroup
+    except ImportError:
+        return
+
+    if hasattr(FSDPParamGroup, "_modelopt_original_post_backward"):
+        return  # Already patched
+
+    FSDPParamGroup._modelopt_original_post_backward = FSDPParamGroup.post_backward
+
+    @torch.no_grad()
+    def _patched_post_backward(self):
+        # Allow bf16 gradients to be assigned to fp32 parameters
+        for fsdp_param in self.fsdp_params:
+            with contextlib.suppress(AttributeError):
+                fsdp_param.sharded_param.grad_dtype = None
+
+        self._modelopt_original_post_backward()
+
+        # Cast gradients to parameter dtype so the optimizer sees matching dtypes
+        for fsdp_param in self.fsdp_params:
+            sp = fsdp_param.sharded_param
+            if sp.grad is not None and sp.grad.dtype != sp.dtype:
+                sp.grad = sp.grad.to(sp.dtype)
+
+    FSDPParamGroup.post_backward = _patched_post_backward
+
+
+def check_awq_smoothquant(quant_cfg):
+    # TODO: Remove this once deepspeed for AWQ and SmoothQuant is added
+    """Get the quantization type from the configuration."""
+    if quant_cfg is None:
+        return False
+    algorithm = quant_cfg.get("algorithm", {})
+    is_awq_smoothquant = False
+    # Check SmoothQuant and AWQ
+    if algorithm and ("smoothquant" in algorithm or "awq" in algorithm):
+        is_awq_smoothquant = True
+
+    return is_awq_smoothquant
+
+
+class QATTrainer(ModelOptHFTrainer):
+    """A drop-in replacement of HuggingFace's Trainer for quantization aware training with ModelOpt.
+
+    This class takes an additional optional argument `quant_args` of type
+    :class:`QuantizationArguments <QuantizationArguments>`
+    to specify the quantization arguments.
+    """
+
+    def __init__(
+        self,
+        *args,
+        quant_args: QuantizationArguments | None = None,
+        **kwargs,
+    ):
+        """Initialize the trainer with modelopt states."""
+        super().__init__(*args, **kwargs)
+
+        self.quant_args = quant_args
+        self.quant_cfg = resolve_quant_cfg_from_args(quant_args, warn_on_quant_cfg=True)
+
+        # Add lora adapter before quantizing the model
+        if getattr(self.args, "lora_config", None) is not None and not hasattr(
+            self.model, "peft_config"
+        ):
+            # TODO: use get_peft_model here instead of add_adapter
+            self.model.add_adapter(self.args.lora_config)
+            print_rank_0("Lora adapter added.")
+
+        if hasattr(self.model, "peft_config") and self.quant_cfg is not None:
+            target_modules = (
+                self.args.lora_config.target_modules if hasattr(self.args, "lora_config") else []
+            )
+            disable_lora_quantizers_in_config(self.quant_cfg, target_modules)
+
+        if self.is_deepspeed_enabled:
+            assert not check_awq_smoothquant(self.quant_cfg), (
+                f"QAT DeepSpeed does not currently support AWQ or SmoothQuant: {self.quant_cfg}"
+            )
+
+        self._patch_accelerate_for_fsdp2_fix()
+
+        self._modelopt_state_path = os.path.join(self.args.output_dir, "modelopt_state_train.pth")
+        if os.path.exists(self._modelopt_state_path) and not is_quantized(self.model):
+            self._restore_modelopt_state_with_weights()
+        elif is_quantized(self.model):
+            self._save_modelopt_state_with_weights()
+
+    def _save_modelopt_state_with_weights(self):
+        """Save the modelopt weights for fsdp2 models."""
+        if torch.distributed.is_initialized():
+            torch.distributed.barrier()
+
+        modelopt_state = mto.modelopt_state(self.model)
+        modelopt_state["modelopt_state_weights"] = get_quantizer_state_dict(self.model)
+
+        if self.args.should_save:
+            torch.save(modelopt_state, self._modelopt_state_path)
+
+        print_rank_0(f"Saved modelopt state to {self._modelopt_state_path}")
+
+    def _restore_modelopt_state_with_weights(self):
+        """Restore the modelopt state with weights."""
+        modelopt_state = mto.load_modelopt_state(self._modelopt_state_path)
+        modelopt_weights = modelopt_state.pop("modelopt_state_weights", None)
+        mto.restore_from_modelopt_state(self.model, modelopt_state)
+        if modelopt_weights is not None:
+            set_quantizer_state_dict(self.model, modelopt_weights)
+        print_rank_0("Restored modelopt state with weights.")
+
+    def _quantize_model(self):
+        """Quantize the model. Restore the quantization state if it exists."""
+        dataset = self.train_dataset if self.train_dataset is not None else self.eval_dataset
+        assert dataset is not None, "Calibration requires either eval or train dataset."
+        num_samples = min(self.quant_args.calib_size, len(dataset))  # type: ignore [union-attr]
+        dataset = torch.utils.data.Subset(dataset, list(range(num_samples)))
+        data_loader = self.get_eval_dataloader(dataset)
+
+        def forward_loop(model):
+            for batch in tqdm(data_loader, desc="Calibrating", disable=not self.args.should_save):
+                batch = self._prepare_inputs(batch)
+                # Important: We should forward pass using the unwrapped model
+                # mtq.quantize will unwrap the model & pass to the forward_loop
+                self.model(**batch)
+
+        # TODO: Remove calibrate_with_adapters - this should not be needed
+        with calibrate_with_adapters(self.model, self.args):
+            print_rank_0("Quantizing the model...")
+            mtq.quantize(self.model, self.quant_cfg, forward_loop)
+
+        # Save modelopt state
+        self._save_modelopt_state_with_weights()
+
+        if getattr(self.quant_args, "compress", False):
+            print_rank_0("Compressing model after calibration")
+            mtq.compress(self.model)
+
+        # Force garbage collection to free up memory
+        gc.collect()
+
+        torch.cuda.empty_cache()
+
+        if self.accelerator.is_main_process:
+            mtq.print_quant_summary(self.model)
+
+    def training_step(self, *args, **kwargs):
+        """Training step."""
+        gc.collect()
+        if self.quant_cfg is not None and not is_quantized(self.model):
+            self._quantize_model()
+        return super().training_step(*args, **kwargs)
+
+    def prediction_step(self, *args, **kwargs):
+        """Prediction step."""
+        gc.collect()
+        if self.quant_cfg is not None and not is_quantized(self.model):
+            self._quantize_model()
+        return super().prediction_step(*args, **kwargs)
+
+    def evaluate(self, *args, **kwargs):
+        """Evaluate the model."""
+        if self.args.do_eval and not self.args.do_train and self.accelerator.is_fsdp2:
+            # [Not related to ModelOpt] HF does not support eval only for FSDP2.
+            self.model = self._prepare_model(self.model)
+        return super().evaluate(*args, **kwargs)
+
+    def train(self, *args, **kwargs):
+        """Train the model."""
+        outputs = super().train(*args, **kwargs)
+        print_rank_0(
+            "Training completed. Please save the final model using `Trainer.save_model()` to preserve ModelOpt states."
+        )
+        return outputs
+
+    def save_model(self, *args, **kwargs):
+        """Save the quantized model."""
+        if (
+            (not self.is_in_train)
+            and self.is_fsdp_enabled
+            and self.accelerator.state.fsdp_plugin.state_dict_type != "FULL_STATE_DICT"
+        ):
+            print_rank_0("Setting state_dict_type to FULL_STATE_DICT for final checkpoint save.")
+            original_type = self.accelerator.state.fsdp_plugin.state_dict_type
+            self.accelerator.state.fsdp_plugin.set_state_dict_type("FULL_STATE_DICT")
+            outputs = super().save_model(*args, **kwargs)
+            self.accelerator.wait_for_everyone()
+            if mto.ModeloptStateManager.is_converted(self.accelerator.unwrap_model(self.model)):
+                print_rank_0(
+                    "Model saved. To restore, call mto.enable_huggingface_checkpointing() first before loading the "
+                    "model. See https://nvidia.github.io/Model-Optimizer/reference/generated/modelopt.torch.opt.plugins.huggingface.html#modelopt.torch.opt.plugins.huggingface.enable_huggingface_checkpointing"
+                )
+            self.accelerator.state.fsdp_plugin.set_state_dict_type(original_type)
+        else:
+            outputs = super().save_model(*args, **kwargs)
+        return outputs
+
+    def _load_best_model(self, *args, **kwargs):
+        """Load the best model for final evaluation."""
+        gc.collect()
+        is_lora = getattr(self.args, "lora", None)
+        if is_lora and not self.is_fsdp_enabled:
+            # Custom logic for loading best model with LoRA
+            # TODO: Remove once we migrate to using get_peft_model()
+            # This custom logic only loads best adapters. Ensure base model is frozen
+            assert all(
+                not param.requires_grad
+                for name, param in self.model.base_model.named_parameters()
+                if "base_layer" in name
+            ), "Some base_layer parameters are not frozen"
+
+            adapter_name = self.model.active_adapters()[0]
+            device = get_module_device(self.model)
+            self.model.delete_adapter(adapter_name)
+            self.model.load_adapter(self.state.best_model_checkpoint, adapter_name)
+            self.model.to(device)
+        else:
+            super()._load_best_model(*args, **kwargs)
+
+    def _patch_accelerate_for_fsdp2_fix(self):
+        """Patch accelerate FSDP2 prepare for TensorQuantizer buffers."""
+        _patch_fsdp2_post_backward()
+
+        def _modelopt_prepare(self, *args, **kwargs):
+            if not self.is_fsdp2:
+                return self._original_prepare(*args, **kwargs)
+
+            model = next((obj for obj in args if isinstance(obj, torch.nn.Module)), None)
+            if model is None:
+                return self._original_prepare(*args, **kwargs)
+
+            # Hide TQ buffers from accelerate's FSDP2 state_dict handling.
+            tq_og_non_prsist_buffers = {}
+            for tq in (m for m in model.modules() if isinstance(m, TensorQuantizer)):
+                # With fsdp_cpu_ram_efficient_loading=true, non-rank-0 processes
+                # hold meta-device buffers which cannot be moved with .to().
+                # Allocate empty tensors on the target device for those; real
+                # values are broadcast from rank 0 after _original_prepare below.
+                for name, buf in list(tq._buffers.items()):
+                    if buf is None:
+                        continue
+                    tq._buffers[name] = (
+                        torch.empty_like(buf, device=self.device)
+                        if buf.is_meta
+                        else buf.to(self.device)
+                    )
+                tq_og_non_prsist_buffers[tq] = tq._non_persistent_buffers_set.copy()
+                tq._non_persistent_buffers_set.update(tq._buffers.keys())
+
+            outputs = self._original_prepare(*args, **kwargs)
+
+            # Restore original buffer persistence.
+            for tq in (m for m in model.modules() if isinstance(m, TensorQuantizer)):
+                tq._non_persistent_buffers_set.clear()
+                tq._non_persistent_buffers_set.update(tq_og_non_prsist_buffers[tq])
+
+            # Sync TQ buffers across ranks. With cpu_ram_efficient_loading, only rank 0
+            # has valid buffer values; other ranks have uninitialized meta-device values.
+            if torch.distributed.is_initialized():
+                for tq in (m for m in model.modules() if isinstance(m, TensorQuantizer)):
+                    for buf in tq._buffers.values():
+                        if buf is not None:
+                            torch.distributed.broadcast(buf, src=0)
+
+            return outputs
+
+        self.accelerator._original_prepare = self.accelerator.prepare
+        self.accelerator.prepare = types.MethodType(_modelopt_prepare, self.accelerator)
+
+
+class QADTrainer(QATTrainer, KDTrainer):
+    """A drop-in replacement of HuggingFace's Trainer for quantization aware distillation with ModelOpt.
+
+    This class takes additional arguments for both distillation and quantization configuration.
+    For details, see
+    :class:`QATTrainer <QATTrainer>`
+    and
+    :class:`KDTrainer <modelopt.torch.distill.plugins.huggingface.KDTrainer>`.
+    """

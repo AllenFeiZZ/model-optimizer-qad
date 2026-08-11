@@ -1,0 +1,109 @@
+# SPEED-bench MTP speculative-decoding run for Qwen3.5-4B via vLLM.
+#
+# Companion to specdec_bench.yaml (the NONE/autoregressive baseline). This
+# variant exercises Qwen3.5-4B's built-in MTP head (text_config.mtp_num_hidden_layers=1)
+# with draft_length=3 to produce real acceptance-rate numbers instead of the
+# trivial AR=1 that NONE yields.
+#
+# Two-task pipeline:
+#   task_0  Quantitative quality split (nvidia/SPEED-Bench-Internal/qualitative)
+#   task_1  Long-context throughput split (nvidia/SPEED-Bench-Internal/throughput_32k)
+#
+# Results write to /scratchspace/qwen35_4b_mtp_vllm/<split>/. The
+# pensieve-intern `specdec_bench` workflow's wrap_up stage owns publishing
+# these to s3://team-specdec-workgroup/results/qwen35_4b_mtp_vllm/<split>/
+# with provenance stamps (jira_ticket + huggingface_model_id). Sweep-name
+# convention: <model>_<algorithm>_<engine> so multi-model / multi-engine
+# records don't collide in S3.
+#
+# Slurm run on cw_dfw:
+#   uv run slurm.py --yaml modules/Model-Optimizer/tools/launcher/examples/Qwen/Qwen3.5-4B/specdec_bench_mtp.yaml --yes
+
+job_name: Qwen3.5-4B_specdec_bench_mtp
+
+pipeline:
+  global_vars:
+    hf_model: /hf-local/Qwen/Qwen3.5-4B
+
+  # Step 1: qualitative split — quality / acceptance-rate numbers with MTP draft=3.
+  # tp_size=2 + concurrency=32 trades aa_timing fidelity for ~30x wall-clock
+  # speedup; acceptance-length (AL) is concurrency-independent and is the
+  # primary metric we care about for this split.
+  task_0:
+    script: common/specdec_bench/run.sh
+    args:
+      - --dataset speed
+      - --dataset_path /hf-local/nvidia/SPEED-Bench-Internal/qualitative
+      - --engine VLLM
+      - --speculative_algorithm MTP
+      - --draft_length 3
+      - --tp_size 2
+      - --ep_size 1
+      - --concurrency 32
+      - --output_length 4096
+      - --aa_timing
+      - --show_progress
+      - --save_dir /scratchspace/qwen35_4b_mtp_vllm/qualitative
+    environment:
+      - HF_MODEL_CKPT: <<global_vars.hf_model>>
+      - HF_LOCAL: /hf-local
+      # dump_env() in examples/specdec_bench/run.py reads provenance from these
+      # env vars when present; they are intentionally NOT set here. Hardcoded
+      # SHAs in a committed YAML would stale-lie about the build that's
+      # actually running. Set them in the harness (planned for Phase 2 in
+      # OMNIML-4788, where slurm.py / launch.py will compute and inject them
+      # at launch time):
+      #
+      #   SPECDEC_BENCH_SHA  = git rev-parse HEAD:examples/specdec_bench
+      #   MODELOPT_SHA       = git -C modules/Model-Optimizer rev-parse HEAD
+      #   MODELOPT_VERSION   = modelopt.__version__ (or git describe --tags)
+      #   NMM_SANDBOX_SHA    = git -C nmm-sandbox rev-parse HEAD
+      #   CONTAINER_IMAGE    = slurm_config.container (the image:tag below)
+      #
+      # When run standalone (without the harness), dump_env falls back to
+      # git rev-parse / module imports on the host filesystem.
+    slurm_config:
+      _factory_: "slurm_factory"
+      nodes: 1
+      ntasks_per_node: 1
+      gpus_per_node: 2
+      container: vllm/vllm-openai:qwen3_5-cu130
+
+  # Step 2: throughput_32k split — long-context throughput with MTP draft=3.
+  # `--num_requests 80` caps the run at 80 samples (split has 1,536) so it fits
+  # in the 4h Slurm time-limit; each 32K-input sample takes ~60-90s.
+  # tp_size=2 doubles the KV-cache budget across 2 GPUs; concurrency=8 keeps
+  # 8 * 32K = 256K tokens of in-flight KV under that doubled budget.
+  task_1:
+    script: common/specdec_bench/run.sh
+    args:
+      - --dataset speed
+      - --dataset_path /hf-local/nvidia/SPEED-Bench-Internal/throughput_32k
+      - --engine VLLM
+      - --speculative_algorithm MTP
+      - --draft_length 3
+      - --tp_size 2
+      - --ep_size 1
+      - --concurrency 8
+      - --num_requests 80
+      - --output_length 4096
+      - --max_seq_len 40960
+      - --aa_timing
+      - --show_progress
+      - --save_dir /scratchspace/qwen35_4b_mtp_vllm/throughput_32k
+    environment:
+      - HF_MODEL_CKPT: <<global_vars.hf_model>>
+      - HF_LOCAL: /hf-local
+    slurm_config:
+      _factory_: "slurm_factory"
+      nodes: 1
+      ntasks_per_node: 1
+      gpus_per_node: 2
+      container: vllm/vllm-openai:qwen3_5-cu130
+
+
+# S3 upload is intentionally not a task in this YAML — the bench pipeline only
+# writes results to /scratchspace/qwen35_4b_mtp_vllm/<split>/. The
+# pensieve-intern specdec_bench workflow's wrap_up stage owns harvesting these
+# from lustre and publishing them to the team S3 vault with provenance stamps
+# (jira_ticket + huggingface_model_id) for the "official record" tracking.

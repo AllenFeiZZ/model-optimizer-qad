@@ -1,0 +1,476 @@
+# SPDX-FileCopyrightText: Copyright (c) 2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+from warnings import warn
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from _test_utils.torch.megatron.utils import initialize_for_megatron
+from huggingface_hub import constants as hf_constants
+from megatron.core.models.gpt import GPTModel
+from megatron.core.models.gpt.gpt_layer_specs import (
+    get_gpt_layer_local_spec,
+    get_gpt_layer_with_transformer_engine_spec,
+    get_gpt_mtp_block_spec,
+)
+from megatron.core.models.mamba import MambaModel
+from megatron.core.parallel_state import (
+    get_pipeline_model_parallel_rank,
+    is_pipeline_first_stage,
+    is_pipeline_last_stage,
+)
+from megatron.core.tensor_parallel.layers import ColumnParallelLinear, RowParallelLinear
+from megatron.core.transformer.module import MegatronModule
+from megatron.core.transformer.transformer_config import MLATransformerConfig, TransformerConfig
+
+from modelopt.torch.export.unified_export_megatron import import_mcore_gpt_from_hf
+from modelopt.torch.nas.plugins.megatron import get_te_hybrid_stack_spec, get_te_mamba_stack_spec
+
+try:
+    from megatron.core.extensions.transformer_engine import TENorm
+    from megatron.core.post_training.modelopt.gpt.model_specs import get_gpt_modelopt_spec
+
+    HAS_TE = True
+except ImportError as e:
+    warn(f"Transformer Engine not installed: {e}")
+    HAS_TE = False
+
+try:
+    import mamba_ssm  # noqa: F401
+    from megatron.core.post_training.modelopt.mamba.model_specs import get_mamba_stack_modelopt_spec
+    from megatron.core.ssm.mamba_layer import MambaLayer  # noqa: F401
+
+    HAS_MAMBA = True
+except ImportError as e:
+    warn(f"Mamba not installed: {e}")
+    HAS_MAMBA = False
+
+try:  # nemo:26.08+ (MambaModel is now a deprecated HybridModel subclass)
+    from megatron.core.models.hybrid.hybrid_model import HybridModel
+    from megatron.core.post_training.modelopt.hybrid.model_specs import (
+        get_hybrid_stack_modelopt_spec,
+    )
+
+    HAS_HYBRID = True
+except ImportError:
+    HAS_HYBRID = False
+
+try:
+    import apex  # noqa: F401
+
+    HAS_APEX = True
+except ImportError as e:
+    warn(f"Apex not installed: {e}")
+    HAS_APEX = False
+
+
+class MegatronModel(MegatronModule):
+    def __init__(
+        self, tp_size: int = 1, cp_size: int = 1, use_te_norm: bool = False, tp_group=None
+    ):
+        config = TransformerConfig(
+            tensor_model_parallel_size=tp_size,
+            context_parallel_size=cp_size,
+            pipeline_model_parallel_size=1,
+            normalization="LayerNorm",
+            # Unused parameters below are set to avoid ZeroDivisionError in __post_init__
+            num_layers=1,
+            hidden_size=tp_size,
+            num_attention_heads=tp_size,
+        )
+        super().__init__(config)
+        self.fc1 = ColumnParallelLinear(
+            32,
+            64,
+            config=config,
+            init_method=torch.nn.init.xavier_uniform_,
+            bias=True,
+            gather_output=False,
+            skip_bias_add=False,
+            is_expert=False,
+            tp_group=tp_group,
+        )
+        self.activation = nn.ReLU()
+        if use_te_norm:
+            assert HAS_TE
+            self.norm = TENorm(config, 64)
+        self.fc2 = RowParallelLinear(
+            64,
+            32,
+            config=config,
+            init_method=torch.nn.init.xavier_uniform_,
+            bias=True,
+            skip_bias_add=False,
+            input_is_parallel=True,
+            is_expert=False,
+            tp_group=tp_group,
+        )
+
+    def forward(self, x):
+        for block in self.children():
+            x = block(x)
+            if isinstance(x, tuple):
+                x = x[0]
+        return x
+
+    def get_dummy_input(self, seed: int | None = None) -> torch.Tensor:
+        if seed is not None:
+            gen = torch.Generator()
+            gen.manual_seed(seed)
+            return torch.randn(1, 4, 32, generator=gen)
+        return torch.randn(1, 4, 32)
+
+
+def get_mcore_gpt_model(
+    tensor_model_parallel_size: int = 1,
+    pipeline_model_parallel_size: int = 1,
+    expert_model_parallel_size: int = 1,
+    expert_tensor_parallel_size: int | None = None,
+    initialize_megatron: bool = False,
+    *,
+    num_layers: int = 2,
+    num_layers_in_first_pipeline_stage: int | None = None,
+    num_layers_in_last_pipeline_stage: int | None = None,
+    hidden_size: int = 64,
+    num_attention_heads: int = 8,
+    num_query_groups: int | None = None,
+    ffn_hidden_size: int | None = 128,
+    max_sequence_length: int = 16,
+    vocab_size: int = 64,
+    position_embedding_type: str = "rope",
+    activation_func: str = "swiglu",
+    normalization: str = "LayerNorm",
+    transformer_impl: str = "modelopt" if HAS_TE else "local",
+    use_cpu_initialization: bool = False,
+    bf16: bool = True,
+    use_te: bool = False,
+    # MoE-specific parameters
+    moe_grouped_gemm: bool = False,
+    moe_ffn_hidden_size: int | None = None,
+    moe_shared_expert_intermediate_size: int | None = None,
+    moe_latent_size: int | None = None,
+    num_moe_experts: int | None = None,
+    # Experimental attention variant (e.g. "gated_delta_net" for Qwen3.5-style hybrid GatedDeltaNet
+    # + gated full-attention layers). When set, the experimental block spec is used.
+    experimental_attention_variant: str | None = None,
+    # Multi-Latent Attention (DeepSeek et al.). When True, an MLATransformerConfig + MLA spec is used.
+    multi_latent_attention: bool = False,
+    # Overrides
+    **config_kwargs: dict,
+) -> GPTModel:
+    assert activation_func in ["swiglu", "squared_relu"]
+    assert normalization in ["LayerNorm", "RMSNorm"]
+    assert transformer_impl in ["local", "transformer_engine", "modelopt"]
+    assert not (multi_latent_attention and experimental_attention_variant is not None), (
+        "multi_latent_attention and experimental_attention_variant are mutually exclusive."
+    )
+    print(f"Using `{transformer_impl=}` model spec for building GPT Model.")
+
+    config_cls = TransformerConfig
+    if multi_latent_attention:
+        assert transformer_impl == "transformer_engine", "MLA tiny model uses the standard TE spec"
+        config_cls = MLATransformerConfig
+        # MLA latent/head-dim defaults for tiny models (override via config_kwargs).
+        config_kwargs = {
+            "q_lora_rank": 32,
+            "kv_lora_rank": 16,
+            "qk_head_dim": 16,
+            "qk_pos_emb_head_dim": 16,
+            "v_head_dim": 16,
+            **config_kwargs,
+        }
+
+    if experimental_attention_variant:
+        # GatedDeltaNet/gated-attention shape defaults for tiny models (override via config_kwargs).
+        config_kwargs = {
+            "experimental_attention_variant": experimental_attention_variant,
+            "linear_attention_freq": 2,  # every 2nd layer is full attention, rest GatedDeltaNet
+            "attention_output_gate": True,
+            "linear_num_key_heads": 2,
+            "linear_num_value_heads": 4,
+            "linear_key_head_dim": 16,
+            "linear_value_head_dim": 16,
+            "linear_conv_kernel_dim": 4,
+            "qk_layernorm": True,
+            "layernorm_zero_centered_gamma": True,
+            **config_kwargs,
+        }
+
+    if initialize_megatron:
+        initialize_for_megatron(
+            tensor_model_parallel_size,
+            pipeline_model_parallel_size,
+            expert_model_parallel_size=expert_model_parallel_size,
+            expert_tensor_parallel_size=expert_tensor_parallel_size,
+        )
+
+    def squared_relu(x):
+        return torch.pow(F.relu(x), 2)
+
+    config = config_cls(
+        tensor_model_parallel_size=tensor_model_parallel_size,
+        pipeline_model_parallel_size=pipeline_model_parallel_size,
+        expert_model_parallel_size=expert_model_parallel_size,
+        expert_tensor_parallel_size=expert_tensor_parallel_size,
+        sequence_parallel=False,
+        num_layers=num_layers,
+        num_layers_in_first_pipeline_stage=num_layers_in_first_pipeline_stage,
+        num_layers_in_last_pipeline_stage=num_layers_in_last_pipeline_stage,
+        hidden_size=hidden_size,
+        num_attention_heads=num_attention_heads,
+        num_query_groups=num_query_groups,
+        ffn_hidden_size=ffn_hidden_size,
+        activation_func=squared_relu if activation_func == "squared_relu" else F.silu,
+        normalization=normalization,
+        gated_linear_unit=(activation_func == "swiglu"),
+        add_bias_linear=False,
+        use_cpu_initialization=use_cpu_initialization,
+        pipeline_dtype=torch.bfloat16 if bf16 else torch.float32,
+        bf16=bf16,
+        # MoE-specific parameters
+        moe_router_dtype=None,
+        moe_grouped_gemm=moe_grouped_gemm,
+        moe_ffn_hidden_size=moe_ffn_hidden_size,
+        moe_shared_expert_intermediate_size=moe_shared_expert_intermediate_size,
+        moe_latent_size=moe_latent_size,
+        moe_router_enable_expert_bias=True,
+        moe_router_score_function="sigmoid",
+        num_moe_experts=num_moe_experts,
+        **config_kwargs,
+    )
+
+    if position_embedding_type == "yarn":  # gpt-oss like model
+        warn("Yarn RoPE config format will change soon. This is a temporary workaround")
+        config.yarn_rotary_scaling_factor = 32.0
+        config.yarn_original_max_position_embeddings = 4096
+        config.yarn_beta_fast = 32.0
+        config.yarn_beta_slow = 1.0
+        config.yarn_mscale = 1.0
+        config.yarn_mscale_all_dim = 0.0
+        config.yarn_correction_range_round_to_int = False
+
+    if experimental_attention_variant:
+        # Lazy import — experimental attention variant spec may be absent in older mcore builds.
+        from megatron.core.models.gpt.experimental_attention_variant_module_specs import (
+            get_transformer_block_with_experimental_attention_variant_spec,
+        )
+
+        transformer_layer_spec = get_transformer_block_with_experimental_attention_variant_spec(
+            config, pp_rank=get_pipeline_model_parallel_rank()
+        )
+    elif transformer_impl == "local":
+        assert HAS_APEX, "Apex not installed"
+        transformer_layer_spec = get_gpt_layer_local_spec(
+            num_experts=num_moe_experts,
+            moe_grouped_gemm=moe_grouped_gemm,
+            normalization=normalization,
+        )
+    else:
+        assert HAS_TE, "Transformer Engine not installed"
+        if transformer_impl == "modelopt":
+            transformer_layer_spec = get_gpt_modelopt_spec(config, remap_te_layernorm=True)
+        else:
+            transformer_layer_spec = get_gpt_layer_with_transformer_engine_spec(
+                num_experts=num_moe_experts,
+                moe_grouped_gemm=moe_grouped_gemm,
+                multi_latent_attention=multi_latent_attention,
+            )
+
+    mtp_block_spec = None
+    if config.mtp_num_layers:
+        use_te = transformer_impl != "local"
+        mtp_block_spec = get_gpt_mtp_block_spec(
+            config=config, spec=transformer_layer_spec, use_transformer_engine=use_te
+        )
+
+    model = GPTModel(
+        config=config,
+        transformer_layer_spec=transformer_layer_spec,
+        mtp_block_spec=mtp_block_spec,
+        vocab_size=vocab_size,
+        max_sequence_length=max_sequence_length,
+        pre_process=is_pipeline_first_stage(),
+        post_process=is_pipeline_last_stage(),
+        share_embeddings_and_output_weights=False,
+        position_embedding_type=position_embedding_type,
+    )
+    return model.to(torch.bfloat16) if bf16 else model
+
+
+def get_mcore_qwen3_600m(
+    tensor_model_parallel_size: int = 1,
+    pipeline_model_parallel_size: int = 1,
+    context_parallel_size: int = 1,
+    workspace_dir: str | None = None,
+) -> GPTModel:
+    config = TransformerConfig(
+        tensor_model_parallel_size=tensor_model_parallel_size,
+        pipeline_model_parallel_size=pipeline_model_parallel_size,
+        context_parallel_size=context_parallel_size,
+        sequence_parallel=False,
+        num_layers=28,
+        hidden_size=1024,
+        num_attention_heads=16,
+        num_query_groups=8,
+        kv_channels=128,
+        ffn_hidden_size=3072,
+        activation_func=F.silu,
+        normalization="RMSNorm",
+        qk_layernorm=True,
+        gated_linear_unit=True,
+        add_bias_linear=False,
+        use_cpu_initialization=False,
+        pipeline_dtype=torch.bfloat16,
+        bf16=True,
+    )
+
+    transformer_layer_spec = get_gpt_modelopt_spec(config, remap_te_layernorm=True)
+
+    model = GPTModel(
+        config=config,
+        transformer_layer_spec=transformer_layer_spec,
+        vocab_size=151936,
+        max_sequence_length=2048,
+        pre_process=is_pipeline_first_stage(),
+        post_process=is_pipeline_last_stage(),
+        share_embeddings_and_output_weights=True,
+        position_embedding_type="rope",
+    )
+
+    model = model.to(torch.bfloat16)
+
+    # Use HF hub cache directory as default workspace_dir
+    if workspace_dir is None:
+        workspace_dir = hf_constants.HF_HUB_CACHE
+
+    import_mcore_gpt_from_hf(
+        model, pretrained_model_path="Qwen/Qwen3-0.6B", workspace_dir=workspace_dir
+    )
+
+    return model
+
+
+def get_mcore_mamba_hybrid_model(
+    tensor_model_parallel_size: int = 1,
+    pipeline_model_parallel_size: int = 1,
+    initialize_megatron: bool = False,
+    *,
+    num_layers: int = 3,
+    num_layers_in_first_pipeline_stage: int | None = None,
+    num_layers_in_last_pipeline_stage: int | None = None,
+    hybrid_layer_pattern: str | None = None,
+    hidden_size: int = 64,
+    num_attention_heads: int = 8,
+    num_query_groups: int | None = None,
+    ffn_hidden_size: int | None = 128,
+    max_sequence_length: int = 4,
+    vocab_size: int = 64,
+    bf16: bool = True,
+    sequence_parallel: bool = False,
+    transformer_impl: str = "modelopt",
+    # Mamba-specific parameters
+    mamba_state_dim: int = 32,
+    mamba_num_heads: int | None = None,
+    mamba_head_dim: int = 16,
+    mamba_num_groups: int = 2,
+    # MoE-specific parameters
+    skip_moe: bool = False,
+    moe_grouped_gemm: bool = False,
+    moe_ffn_hidden_size: int | None = 64,
+    moe_shared_expert_intermediate_size: int | None = 32,
+    num_moe_experts: int | None = 8,
+    **config_kwargs: dict,
+) -> MambaModel:
+    """Builds a Mamba model with hybrid layer allocation (Mamba, MoE, Attention, MLP blocks).
+
+    Notable Args:
+        hybrid_layer_pattern: The hybrid layer pattern to use.
+            If None, a default pattern will be generated.
+        skip_moe: Whether to skip MoE blocks in default hybrid pattern.
+    """
+    assert HAS_MAMBA, "Mamba not installed"
+
+    if initialize_megatron:
+        initialize_for_megatron(tensor_model_parallel_size, pipeline_model_parallel_size)
+
+    config = TransformerConfig(
+        tensor_model_parallel_size=tensor_model_parallel_size,
+        pipeline_model_parallel_size=pipeline_model_parallel_size,
+        sequence_parallel=sequence_parallel,
+        num_layers=num_layers,
+        num_layers_in_first_pipeline_stage=num_layers_in_first_pipeline_stage,
+        num_layers_in_last_pipeline_stage=num_layers_in_last_pipeline_stage,
+        hidden_size=hidden_size,
+        num_attention_heads=num_attention_heads,
+        num_query_groups=num_query_groups,
+        ffn_hidden_size=ffn_hidden_size,
+        mamba_state_dim=mamba_state_dim,
+        mamba_num_heads=mamba_num_heads,
+        mamba_head_dim=mamba_head_dim,
+        mamba_num_groups=mamba_num_groups,
+        num_moe_experts=num_moe_experts,
+        moe_grouped_gemm=moe_grouped_gemm,
+        moe_ffn_hidden_size=moe_ffn_hidden_size,
+        moe_shared_expert_intermediate_size=moe_shared_expert_intermediate_size,
+        moe_router_enable_expert_bias=True,
+        moe_router_score_function="sigmoid",
+        add_bias_linear=False,
+        pipeline_dtype=torch.bfloat16 if bf16 else torch.float32,
+        bf16=bf16,
+        **config_kwargs,
+    )
+
+    if hybrid_layer_pattern is None:
+        # Generate pattern by repeating base_pattern and trimming to match num_layers
+        #   E.g. for num_layers=3, return "MEM" (Mamba -> MoE -> Mamba)
+        #   E.g. for num_layers=6, return "MEM*M-" (Mamba -> MoE -> Attention -> MoE -> MLP)
+        base_pattern = "M*M-" if skip_moe else "MEM*M-"
+        hybrid_layer_pattern = (base_pattern * num_layers)[:num_layers]
+
+    # NOTE: We intentionally keep hybrid_layer_pattern pipe-free even under PP>1 (MCore warns and
+    # runtime-slices). This matches how bridge-loaded models are pruned; ModelOpt's depth-pruning
+    # slicer is not `|`-aware, so pipe stage separators would break pattern slicing -- reject them.
+    assert "|" not in hybrid_layer_pattern, "Pipeline separators (`|`) are not supported"
+    assert len(hybrid_layer_pattern) == num_layers
+
+    # nemo:26.08+ uses HybridModel + hybrid_layer_pattern; older uses deprecated MambaModel.
+    common_kwargs = {
+        "config": config,
+        "vocab_size": vocab_size,
+        "max_sequence_length": max_sequence_length,
+        "pre_process": is_pipeline_first_stage(),
+        "post_process": is_pipeline_last_stage(),
+        "share_embeddings_and_output_weights": False,
+        "position_embedding_type": "none",
+    }
+    if HAS_HYBRID:
+        spec = (
+            get_te_hybrid_stack_spec(moe_grouped_gemm)
+            if transformer_impl == "transformer_engine"
+            else get_hybrid_stack_modelopt_spec(remap_te_layernorm=True)
+        )
+        model = HybridModel(
+            hybrid_stack_spec=spec, hybrid_layer_pattern=hybrid_layer_pattern, **common_kwargs
+        )
+    else:
+        spec = (
+            get_te_mamba_stack_spec(moe_grouped_gemm)
+            if transformer_impl == "transformer_engine"
+            else get_mamba_stack_modelopt_spec(remap_te_layernorm=True)
+        )
+        model = MambaModel(
+            mamba_stack_spec=spec, hybrid_override_pattern=hybrid_layer_pattern, **common_kwargs
+        )
+    return model.to(torch.bfloat16) if bf16 else model
